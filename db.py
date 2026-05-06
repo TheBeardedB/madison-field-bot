@@ -85,35 +85,6 @@ class Database:
             )
             return row["last_pub_date"] if row else None
 
-    async def claim_pub_date(self, guild_id: str, feed_id: str, pub_date: str) -> bool:
-        """
-        Atomically advance last_pub_date to pub_date.
-        Returns True if this caller should post (the pub_date is new).
-        Returns False if the pub_date was already recorded — skip posting.
-
-        Uses RETURNING so the result is unambiguous: a row is returned only
-        when something was actually inserted or updated (i.e. pub_date changed).
-        When ON CONFLICT DO UPDATE's WHERE clause is false (same pub_date),
-        PostgreSQL takes the DO NOTHING path and RETURNING yields no rows.
-        Checking the command tag ("UPDATE 0" vs "INSERT 0 0") is unreliable
-        across PostgreSQL versions — RETURNING is not.
-        """
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO feed_state (guild_id, feed_id, last_pub_date, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (guild_id, feed_id) DO UPDATE
-                    SET last_pub_date = EXCLUDED.last_pub_date,
-                        updated_at    = NOW()
-                WHERE feed_state.last_pub_date IS DISTINCT FROM EXCLUDED.last_pub_date
-                RETURNING guild_id
-                """,
-                guild_id,
-                feed_id,
-                pub_date,
-            )
-        return row is not None
 
     async def load_all_feed_states(self) -> Dict[str, str]:
         """Return {'{guild_id}:{feed_id}': last_pub_date} for all feeds."""
