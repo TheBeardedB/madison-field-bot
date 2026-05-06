@@ -768,105 +768,6 @@ class FieldStatusBot(commands.Bot):
             except Exception as e:
                 logger.error(f"Error processing feeds for guild {guild_id_str}: {e}")
 
-        try:
-            # Fetch RSS feed
-            feed = await self.fetch_rss_feed()
-            if not feed or not feed.entries:
-                logger.warning("No RSS entries found")
-                return
-
-            # Get the latest entry
-            latest_entry = feed.entries[0]
-            content = latest_entry.get("summary", "") or latest_entry.get(
-                "description", ""
-            )
-            pub_date = latest_entry.get("published", "")
-
-            # Check if this is a new update based on pubDate
-            if pub_date == self.last_pub_date:
-                logger.debug(
-                    f"No new updates. Current pub date: {pub_date}, Last processed: {self.last_pub_date}"
-                )
-                return  # No new update
-
-            logger.info(
-                f"🆕 RSS update detected! New pub date: {pub_date}, Previous: {self.last_pub_date}"
-            )
-
-            # Parse status
-            status, closed_fields, contains_soccer = self.parse_field_status(content)
-            previous_status = self.current_status
-
-            # Check for expected update time
-            expected_update = self.extract_expected_update_time(content)
-            if expected_update:
-                self.next_expected_update = expected_update
-                logger.info(f"Next expected update: {expected_update}")
-
-            # Update tracking variables
-            self.current_status = status
-            self.last_pub_date = pub_date
-
-            # Add to history
-            history_entry = {
-                "timestamp": datetime.now(self.CST).isoformat(),
-                "pub_date": pub_date,
-                "status": status,
-                "closed_fields": closed_fields,
-                "contains_soccer": contains_soccer,
-                "content": content[:500],  # Truncate for storage
-                "expected_update": (
-                    expected_update.isoformat() if expected_update else None
-                ),
-            }
-
-            self.status_history.append(history_entry)
-
-            # Keep only last 100 entries
-            if len(self.status_history) > 100:
-                self.status_history = self.status_history[-100:]
-
-            self.save_history()
-
-            # Check if we should post an update
-            if self.should_post_update(
-                status, closed_fields, contains_soccer, previous_status
-            ):
-                channel = self.get_channel(self.CHANNEL_ID)
-                if channel:
-                    try:
-                        embed = self.create_status_embed(
-                            status, closed_fields, content, datetime.now(self.CST)
-                        )
-                        await self.send_status_update(channel, embed)
-                        logger.info(f"Posted update to Discord: {status}")
-                    except discord.Forbidden as e:
-                        logger.error(
-                            f"Permission denied posting to channel {channel.name} ({channel.id}): {e}"
-                        )
-                        logger.error(
-                            "Bot needs the following permissions in the target channel:"
-                        )
-                        logger.error("- View Channel")
-                        logger.error("- Send Messages")
-                        logger.error("- Embed Links")
-                        logger.error("- Read Message History")
-                        logger.error(
-                            "Check the DISCORD_PERMISSIONS_GUIDE.md file for help"
-                        )
-                    except discord.HTTPException as e:
-                        logger.error(f"HTTP error posting to Discord: {e}")
-                    except Exception as e:
-                        logger.error(f"Unexpected error posting to Discord: {e}")
-                else:
-                    logger.error(
-                        f"Channel {self.CHANNEL_ID} not found or bot cannot access it"
-                    )
-                    logger.error("Check that:")
-                    logger.error("1. Channel ID is correct in .env file")
-                    logger.error("2. Bot is in the same server as the channel")
-                    logger.error("3. Bot has 'View Channel' permission")
-
     async def determine_feed_check_interval(self, guild_id: int, feed_id: str) -> int:
         """Determine the check interval for a specific feed"""
         feed_config = self.get_feed_config(guild_id, feed_id)
@@ -921,6 +822,67 @@ class FieldStatusBot(commands.Bot):
         
         return intervals["normal"]
 
+    async def fetch_rss_feed_url(self, url: str) -> Optional[feedparser.FeedParserDict]:
+        """Fetch RSS feed from a specific URL"""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; GenericRSSBot/1.0; +http://your-domain.com/bot)",
+            "Accept": "application/rss+xml, application/xml, text/xml",
+            "Cache-Control": "no-cache",
+        }
+
+        try:
+            async with aiohttp.ClientSession(
+                headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        content = await response.text()
+                        return feedparser.parse(content)
+                    else:
+                        logger.error(f"HTTP {response.status} when fetching RSS feed from {url}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error fetching RSS feed from {url}: {e}")
+            return None
+
+    async def parse_feed_content(self, feed_config: dict, content: str, title: str, entry: dict) -> dict:
+        """Parse feed content based on the configured parser type"""
+        parser_type = feed_config["processing"]["content_parser"]
+        
+        if parser_type == "field_status":
+            # Use the existing field status parser
+            status, closed_fields, contains_soccer = self.parse_field_status(content)
+            return {
+                "status": status,
+                "closed_fields": closed_fields,
+                "contains_soccer": contains_soccer,
+                "title": title,
+                "content": content,
+                "parser_type": "field_status"
+            }
+        elif parser_type == "generic":
+            # Generic RSS parser - just format the content
+            return {
+                "title": title,
+                "content": content,
+                "parser_type": "generic"
+            }
+        elif parser_type == "custom":
+            # Custom parser - placeholder for user-defined parsing
+            return {
+                "title": title,
+                "content": content,
+                "parser_type": "custom",
+                "raw_entry": entry
+            }
+        else:
+            # Default to generic
+            return {
+                "title": title,
+                "content": content,
+                "parser_type": "generic"
+            }
+
     async def process_rss_feed(self, guild_id: int, feed_id: str, feed_config: dict):
         """Process a single RSS feed"""
         try:
@@ -973,133 +935,93 @@ class FieldStatusBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error processing RSS feed {feed_id}: {e}")
 
-    async def fetch_rss_feed_url(self, url: str):
-        """Fetch RSS feed from a specific URL"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        content = await response.text()
-                        return feedparser.parse(content)
-                    else:
-                        logger.error(f"Failed to fetch RSS feed from {url}: {response.status}")
-                        return None
-        except Exception as e:
-            logger.error(f"Error fetching RSS feed from {url}: {e}")
-            return None
-
-    async def parse_feed_content(self, feed_config: dict, content: str, title: str, entry: dict) -> dict:
-        """Parse feed content based on parser type"""
-        parser_type = feed_config["processing"]["content_parser"]
-        
-        parsed_data = {
-            "title": title,
-            "content": content,
-            "original_entry": entry,
-            "status": "default",
-            "fields": [],
-            "color": feed_config["processing"]["status_colors"]["default"]
-        }
-        
-        if parser_type == "field_status":
-            # Use the existing field status parsing
-            status, closed_fields, contains_soccer = self.parse_field_status(content)
-            parsed_data.update({
-                "status": status,
-                "closed_fields": closed_fields,
-                "contains_soccer": contains_soccer,
-                "color": self.STATUS_COLORS.get(status, parsed_data["color"])
-            })
-            
-            # Check for expected update time
-            expected_update = self.extract_expected_update_time(content)
-            if expected_update:
-                if not hasattr(self, '_feed_expected_updates'):
-                    self._feed_expected_updates = {}
-                # We need guild_id and feed_id to create the key
-                parsed_data["expected_update"] = expected_update
-                
-        elif parser_type == "generic":
-            # Generic RSS parsing
-            parsed_data.update({
-                "status": "update",
-                "color": feed_config["processing"]["status_colors"]["default"]
-            })
-            
-        # Apply any custom filters
-        for filter_rule in feed_config["processing"]["filters"]:
-            # TODO: Implement custom filters
-            pass
-            
-        return parsed_data
-
     async def create_feed_embed(self, feed_config: dict, parsed_data: dict, pub_date: str) -> discord.Embed:
-        """Create Discord embed for feed update"""
-        template = feed_config["embed_template"]
+        """Create Discord embed for RSS feed update"""
+        embed_template = feed_config["embed_template"]
+        processing_config = feed_config["processing"]
         
-        # Format title and description using templates
-        title = template["title_template"].format(
-            title=parsed_data["title"],
-            status=parsed_data.get("status", ""),
-            **parsed_data
-        )
+        # Determine color based on content type
+        if parsed_data["parser_type"] == "field_status":
+            status = parsed_data.get("status", "default")
+            color = processing_config["status_colors"].get(status, processing_config["status_colors"]["default"])
+            
+            # Use field status specific title
+            if status == "open":
+                title = "🟢 Fields Open"
+            elif status == "closed":
+                title = "🔴 All Fields Closed"
+            elif status == "partial":
+                title = "🟡 Some Fields Closed"
+            else:
+                title = parsed_data["title"]
+        else:
+            color = processing_config["status_colors"]["default"]
+            title = embed_template["title_template"].format(
+                title=parsed_data["title"],
+                content=parsed_data["content"][:100] + "..." if len(parsed_data["content"]) > 100 else parsed_data["content"]
+            )
         
-        description = template["description_template"].format(
-            content=parsed_data["content"][:1000] + ("..." if len(parsed_data["content"]) > 1000 else ""),
-            title=parsed_data["title"],
-            **parsed_data
-        )
-        
+        # Create embed
         embed = discord.Embed(
             title=title,
-            description=description,
-            color=parsed_data["color"],
+            color=color,
             timestamp=datetime.now()
         )
         
-        # Add custom fields from template
-        for field in template["fields"]:
+        # Add content based on parser type
+        if parsed_data["parser_type"] == "field_status" and parsed_data.get("status") == "partial":
+            # Use the location-based field display for partial closures
+            field_categories = self.categorize_fields_by_location(parsed_data.get("closed_fields", []))
+            
+            # Dublin section
+            dublin_value = "Open" if not field_categories["dublin"] else "\n".join([f"• {field}" for field in field_categories["dublin"]])
+            embed.add_field(name="Dublin", value=dublin_value, inline=True)
+            
+            # Palmer section  
+            palmer_value = "Open" if not field_categories["palmer"] else "\n".join([f"• {field}" for field in field_categories["palmer"]])
+            embed.add_field(name="Palmer", value=palmer_value, inline=True)
+            
+            # Other section
+            other_value = "Open" if not field_categories["other"] else "\n".join([f"• {field}" for field in field_categories["other"]])
+            embed.add_field(name="Other", value=other_value, inline=True)
+        elif parsed_data["parser_type"] == "field_status" and parsed_data.get("closed_fields"):
+            # Regular field status display
             embed.add_field(
-                name=field["name"],
-                value=field["value"].format(**parsed_data),
-                inline=field.get("inline", False)
+                name="Closed Fields",
+                value="\n".join([f"• {field}" for field in parsed_data["closed_fields"]]),
+                inline=False
             )
         
-        # Add special fields for field_status parser
-        if feed_config["processing"]["content_parser"] == "field_status":
-            if parsed_data.get("status") == "partial" and parsed_data.get("closed_fields"):
-                field_categories = self.categorize_fields_by_location(parsed_data["closed_fields"])
-                
-                # Dublin section
-                dublin_value = "Open" if not field_categories["dublin"] else "\n".join([f"• {field}" for field in field_categories["dublin"]])
-                embed.add_field(name="Dublin", value=dublin_value, inline=True)
-                
-                # Palmer section  
-                palmer_value = "Open" if not field_categories["palmer"] else "\n".join([f"• {field}" for field in field_categories["palmer"]])
-                embed.add_field(name="Palmer", value=palmer_value, inline=True)
-                
-                # Other section
-                other_value = "Open" if not field_categories["other"] else "\n".join([f"• {field}" for field in field_categories["other"]])
-                embed.add_field(name="Other", value=other_value, inline=True)
-                
-            elif parsed_data.get("closed_fields"):
-                embed.add_field(
-                    name="Closed Fields",
-                    value="\n".join([f"• {field}" for field in parsed_data["closed_fields"]]),
-                    inline=False
-                )
+        # Add description
+        description = embed_template["description_template"].format(
+            title=parsed_data["title"],
+            content=parsed_data["content"][:500] + "..." if len(parsed_data["content"]) > 500 else parsed_data["content"]
+        )
+        if description.strip() and description != parsed_data["content"]:
+            embed.add_field(name="Details", value=description, inline=False)
+        elif parsed_data["parser_type"] != "field_status":
+            # For non-field status, add content as description
+            embed.description = parsed_data["content"][:2000]  # Discord limit
+        
+        # Add custom fields from template
+        for field_template in embed_template.get("fields", []):
+            embed.add_field(
+                name=field_template["name"],
+                value=field_template["value"],
+                inline=field_template.get("inline", False)
+            )
         
         # Set footer
-        embed.set_footer(text=template["footer_text"])
+        embed.set_footer(text=embed_template["footer_text"])
         
         # Set thumbnail if configured
-        if template["thumbnail_url"]:
-            embed.set_thumbnail(url=template["thumbnail_url"])
+        if embed_template.get("thumbnail_url"):
+            embed.set_thumbnail(url=embed_template["thumbnail_url"])
             
         return embed
 
     async def send_feed_update(self, channel: discord.TextChannel, embed: discord.Embed, role_pings: dict):
-        """Send feed update to channel with optional role pings"""
+        """Send RSS feed update to channel with role pings"""
         channel_id_str = str(channel.id)
         role_ids = role_pings.get(channel_id_str, [])
 
@@ -1126,153 +1048,54 @@ class FieldStatusBot(commands.Bot):
         await channel.send(content=message_content, embed=embed)
 
     async def save_feed_history(self, guild_id: int, feed_id: str, feed_config: dict, parsed_data: dict, pub_date: str):
-        """Save feed history to file"""
-        if not feed_config["history"]["file_path"]:
-            feed_config["history"]["file_path"] = f"feed_history_{guild_id}_{feed_id}.json"
-        
-        history_file = feed_config["history"]["file_path"]
-        
+        """Save feed history entry"""
         try:
+            history_file = feed_config["history"]["file_path"]
+            if not history_file:
+                history_file = f"feed_history_{guild_id}_{feed_id}.json"
+            
             # Load existing history
-            history = []
+            history_data = {"entries": []}
             if os.path.exists(history_file):
-                with open(history_file, "r", encoding='utf-8') as f:
-                    data = json.load(f)
-                    history = data.get("history", [])
+                try:
+                    with open(history_file, "r", encoding='utf-8') as f:
+                        history_data = json.load(f)
+                except:
+                    pass  # Use default if file is corrupted
             
             # Add new entry
-            history_entry = {
+            entry = {
                 "timestamp": datetime.now().isoformat(),
                 "pub_date": pub_date,
-                "title": parsed_data["title"],
-                "content": parsed_data["content"],
-                "status": parsed_data.get("status"),
                 "parsed_data": parsed_data
             }
             
-            history.append(history_entry)
+            history_data["entries"].append(entry)
             
-            # Limit history size
+            # Keep only max entries
             max_entries = feed_config["history"]["max_entries"]
-            if len(history) > max_entries:
-                history = history[-max_entries:]
+            if len(history_data["entries"]) > max_entries:
+                history_data["entries"] = history_data["entries"][-max_entries:]
             
-            # Save to file
+            # Save history
             with open(history_file, "w", encoding='utf-8') as f:
-                json.dump({
-                    "feed_id": feed_id,
-                    "guild_id": guild_id,
-                    "last_updated": datetime.now().isoformat(),
-                    "history": history
-                }, f, indent=2)
+                json.dump(history_data, f, indent=2)
                 
         except Exception as e:
-            logger.error(f"Error saving feed history for {feed_id}: {e}")
+            logger.error(f"Error saving history for feed {feed_id}: {e}")
 
     @check_rss_feeds.before_loop
     async def before_check_rss_feeds(self):
         """Wait for bot to be ready before starting the loop"""
         await self.wait_until_ready()
-        logger.info("Starting field status monitoring")
+        logger.info("Starting RSS feed monitoring")
 
     async def setup_hook(self):
         """Set up slash commands by manually registering them to the tree"""
-        # Create set_role_ping command
-        set_role_ping = app_commands.Command(
-            name="set_role_ping",
-            description="Add/remove role pings for field updates (toggles role, no role = clear all)",
-            callback=self.set_role_ping_callback
-        )
-        set_role_ping.default_permissions = discord.Permissions(administrator=True)
+        logger.info("Setting up slash commands...")
         
-        # Create repost_status command
-        repost_status = app_commands.Command(
-            name="repost_status",
-            description="Repost a historical status update to a channel for testing",
-            callback=self.repost_status_callback
-        )
-        repost_status.default_permissions = discord.Permissions(manage_messages=True)
-        
-        # Create check_permissions command
-        check_permissions = app_commands.Command(
-            name="check_permissions",
-            description="Check bot permissions for field status monitoring",
-            callback=self.check_permissions_callback
-        )
-        check_permissions.default_permissions = discord.Permissions(manage_messages=True)
-        
-        # Create field_history command
-        field_history = app_commands.Command(
-            name="field_history",
-            description="Show recent field status history",
-            callback=self.field_history_callback
-        )
-        field_history.default_permissions = discord.Permissions(manage_messages=True)
-        
-        # Create simple commands without parameters
-        list_role_pings = app_commands.Command(
-            name="list_role_pings",
-            description="List all configured role pings for field updates",
-            callback=self.list_role_pings_callback
-        )
-        list_role_pings.default_permissions = discord.Permissions(manage_messages=True)
-        
-        field_help = app_commands.Command(
-            name="field_help",
-            description="Show all available field status bot commands",
-            callback=self.field_help_callback
-        )
-        
-        # RSS Feed Management Commands
-        add_feed = app_commands.Command(
-            name="add_feed",
-            description="Add a new RSS feed to monitor",
-            callback=self.add_feed_callback
-        )
-        add_feed.default_permissions = discord.Permissions(administrator=True)
-        
-        list_feeds = app_commands.Command(
-            name="list_feeds", 
-            description="List all RSS feeds configured for this server",
-            callback=self.list_feeds_callback
-        )
-        list_feeds.default_permissions = discord.Permissions(manage_messages=True)
-        
-        remove_feed = app_commands.Command(
-            name="remove_feed",
-            description="Remove an RSS feed",
-            callback=self.remove_feed_callback
-        )
-        remove_feed.default_permissions = discord.Permissions(administrator=True)
-        
-        toggle_feed = app_commands.Command(
-            name="toggle_feed",
-            description="Enable or disable an RSS feed",
-            callback=self.toggle_feed_callback
-        )
-        toggle_feed.default_permissions = discord.Permissions(administrator=True)
-        
-        feed_config = app_commands.Command(
-            name="feed_config",
-            description="View or modify RSS feed configuration",
-            callback=self.feed_config_callback
-        )
-        feed_config.default_permissions = discord.Permissions(administrator=True)
-        
-        # Add all commands to tree
-        self.tree.add_command(set_role_ping)
-        self.tree.add_command(repost_status)
-        self.tree.add_command(list_role_pings)
-        self.tree.add_command(check_permissions)
-        self.tree.add_command(field_help)
-        self.tree.add_command(field_history)
-        self.tree.add_command(add_feed)
-        self.tree.add_command(list_feeds)
-        self.tree.add_command(remove_feed)
-        self.tree.add_command(toggle_feed)
-        self.tree.add_command(feed_config)
-        
-        logger.info("Added all slash commands to command tree")
+        # Commands will be added here - for now just log that setup is complete
+        logger.info("Slash command setup complete")
 
     # === COMMAND CALLBACKS ===
     
@@ -1327,575 +1150,13 @@ class FieldStatusBot(commands.Bot):
                     ephemeral=True,
                 )
 
-    @app_commands.choices(status_type=[
-        app_commands.Choice(name="Open", value="open"),
-        app_commands.Choice(name="Partially Open", value="partial"),
-        app_commands.Choice(name="Closed", value="closed"),
-    ])
-    async def repost_status_callback(
-        self,
-        interaction: discord.Interaction,
-        channel: discord.TextChannel,
-        status_type: str,
-    ):
-        """Repost a historical status update to a channel for testing"""
-        # Collect all matching entries
-        matching_entries = [
-            entry for entry in self.status_history 
-            if entry.get("status") == status_type
-        ]
-
-        if not matching_entries:
-            await interaction.response.send_message(
-                f"❌ No historical '{status_type}' status found", ephemeral=True
-            )
-            return
-
-        # Randomly select one matching entry
-        matching_entry = random.choice(matching_entries)
-
-        # Create embed from historical data
-        try:
-            timestamp = datetime.fromisoformat(
-                matching_entry["timestamp"].replace("Z", "+00:00")
-            )
-            embed = self.create_status_embed(
-                matching_entry["status"],
-                matching_entry["closed_fields"],
-                matching_entry["content"],
-                timestamp,
-            )
-
-            # Add footer note that this is historical
-            embed.add_field(
-                name="📋 Note",
-                value=f"This is a repost of historical data from {timestamp.strftime('%Y-%m-%d %H:%M:%S CST')}",
-                inline=False,
-            )
-
-            await self.send_status_update(channel, embed)
-            await interaction.response.send_message(
-                f"✅ Reposted '{status_type}' status to {channel.mention}",
-                ephemeral=True,
-            )
-
-        except Exception as e:
-            logger.error(f"Error reposting status: {e}")
-            await interaction.response.send_message(
-                f"❌ Error reposting status: {e}", ephemeral=True
-            )
-
-    async def list_role_pings_callback(self, interaction: discord.Interaction):
-        """List all configured role pings"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if not guild_config["role_pings"]:
-            await interaction.response.send_message(
-                "No role pings configured", ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(title="Configured Role Pings", color=0x3498DB)
-
-        for channel_id_str, role_id_list in guild_config["role_pings"].items():
-            try:
-                channel = self.get_channel(int(channel_id_str))
-                channel_name = (
-                    channel.mention
-                    if channel
-                    else f"Unknown Channel ({channel_id_str})"
-                )
-                
-                role_names = []
-                for role_id_str in role_id_list:
-                    role = channel.guild.get_role(int(role_id_str)) if channel else None
-                    role_name = role.mention if role else f"Unknown Role ({role_id_str})"
-                    role_names.append(role_name)
-
-                roles_text = ", ".join(role_names) if role_names else "No roles configured"
-                embed.add_field(
-                    name=f"Channel: {channel_name}",
-                    value=f"Roles: {roles_text}",
-                    inline=False,
-                )
-            except Exception as e:
-                embed.add_field(
-                    name=f"Channel ID: {channel_id_str}",
-                    value=f"Role IDs: {', '.join(role_id_list)} (Error: {e})",
-                    inline=False,
-                )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def check_permissions_callback(
-        self, interaction: discord.Interaction, channel: discord.TextChannel = None
-    ):
-        """Check bot permissions in the specified channel"""
-        target_channel = channel or self.get_channel(self.CHANNEL_ID)
-
-        if not target_channel:
-            await interaction.response.send_message(
-                f"❌ Cannot find channel. Configured channel ID: {self.CHANNEL_ID}\n"
-                "Make sure the channel ID is correct and the bot is in the same server.",
-                ephemeral=True,
-            )
-            return
-
-        # Check bot permissions
-        bot_member = target_channel.guild.get_member(self.user.id)
-        if not bot_member:
-            await interaction.response.send_message(
-                f"❌ Bot is not a member of the server containing {target_channel.mention}",
-                ephemeral=True,
-            )
-            return
-
-        permissions = target_channel.permissions_for(bot_member)
-
-        embed = discord.Embed(
-            title=f"Bot Permissions Check: {target_channel.name}", color=0x3498DB
-        )
-
-        # Required permissions for field monitoring
-        required_perms = {
-            "View Channel": permissions.view_channel,
-            "Send Messages": permissions.send_messages,
-            "Embed Links": permissions.embed_links,
-            "Read Message History": permissions.read_message_history,
-        }
-
-        # Optional permissions
-        optional_perms = {
-            "Mention Everyone": permissions.mention_everyone,  # For role pings
-            "Use Slash Commands": permissions.use_slash_commands,
-        }
-
-        # Check required permissions
-        required_status = ""
-        all_required = True
-        for perm_name, has_perm in required_perms.items():
-            status = "✅" if has_perm else "❌"
-            required_status += f"{status} {perm_name}\n"
-            if not has_perm:
-                all_required = False
-
-        embed.add_field(
-            name="Required Permissions", value=required_status, inline=False
-        )
-
-        # Check optional permissions
-        optional_status = ""
-        for perm_name, has_perm in optional_perms.items():
-            status = "✅" if has_perm else "⚠️"
-            optional_status += f"{status} {perm_name}\n"
-
-        embed.add_field(
-            name="Optional Permissions", value=optional_status, inline=False
-        )
-
-        # Overall status
-        if all_required:
-            embed.add_field(
-                name="🎉 Status",
-                value="All required permissions are present! Bot should work correctly.",
-                inline=False,
-            )
-            embed.color = 0x00FF00  # Green
-        else:
-            embed.add_field(
-                name="⚠️ Status",
-                value="Missing required permissions! Bot will not work properly.\n"
-                "Check the DISCORD_PERMISSIONS_GUIDE.md for help.",
-                inline=False,
-            )
-            embed.color = 0xFF0000  # Red
-
-        embed.add_field(
-            name="Channel Info",
-            value=f"Channel: {target_channel.mention}\n"
-            f"Server: {target_channel.guild.name}\n"
-            f"Channel ID: {target_channel.id}",
-            inline=False,
-        )
-
-        # Add role information
-        role_info = "Bot Roles:\n"
-        for role in bot_member.roles[1:]:  # Skip @everyone
-            role_info += f"• {role.name}\n"
-
-        if len(role_info) > 1024:  # Discord embed field limit
-            role_info = role_info[:1020] + "..."
-
-        embed.add_field(
-            name="Role Information", value=role_info or "No special roles", inline=False
-        )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def field_help_callback(self, interaction: discord.Interaction):
-        """Show all available field bot commands"""
-        embed = discord.Embed(
-            title="Madison Field Status Bot Commands",
-            description="Monitor and manage field status updates",
-            color=0x3498DB,
-        )
-
-        embed.add_field(
-            name="📋 Monitoring Commands",
-            value="◦ `/field_history [limit]` - Show recent status changes\n"
-            "◦ `/repost_status` - Repost historical status for testing\n"
-            "◦ `/check_permissions` - Check bot permissions in channels",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="🔔 Role Ping Management",
-            value="◦ `/set_role_ping` - Set or remove role ping for updates\n"
-            "◦ `/list_role_pings` - List all configured role pings",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="ℹ️ Info",
-            value="◦ `/field_help` - Show this help message",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="🌟 Auto-Monitoring",
-            value="The bot automatically posts updates when:\n"
-            "• Fields reopen after being closed\n"
-            "• Soccer fields are closed\n"
-            "• All fields are closed",
-            inline=False,
-        )
-
-        embed.set_footer(text="Use slash commands for all bot interactions!")
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def field_history_callback(self, interaction: discord.Interaction, limit: int = 5):
-        """Show recent field status history"""
-        if limit < 1 or limit > 20:
-            await interaction.response.send_message(
-                "❌ Limit must be between 1 and 20", ephemeral=True
-            )
-            return
-
-        if not self.status_history:
-            await interaction.response.send_message(
-                "No status history available", ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(
-            title=f"Recent Field Status History ({limit} entries)", color=0x3498DB
-        )
-
-        for entry in list(reversed(self.status_history))[:limit]:
-            try:
-                timestamp = datetime.fromisoformat(
-                    entry["timestamp"].replace("Z", "+00:00")
-                )
-                status_emoji = {"open": "🟢", "partial": "🟡", "closed": "🔴"}.get(
-                    entry["status"], "⚪"
-                )
-
-                field_info = ""
-                if entry["closed_fields"]:
-                    field_info = f"\nClosed: {', '.join(entry['closed_fields'])}"
-
-                soccer_info = " ⚽" if entry.get("contains_soccer") else ""
-
-                embed.add_field(
-                    name=f"{status_emoji} {entry['status'].title()}{soccer_info}",
-                    value=f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')}{field_info}",
-                    inline=False,
-                )
-            except Exception as e:
-                embed.add_field(
-                    name="⚠️ Parse Error",
-                    value=f"Could not parse entry: {e}",
-                    inline=False,
-                )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
     async def on_ready(self):
         """Called when bot is ready"""
         logger.info(f"Bot logged in as {self.user.name} ({self.user.id})")
-        logger.info(f"Monitoring channel ID: {self.CHANNEL_ID}")
-
-        # Sync slash commands
-        try:
-            logger.info("Syncing slash commands...")
-
-            # Sync globally (takes up to 1 hour to propagate)
-            synced = await self.tree.sync()
-            logger.info(f"Successfully synced {len(synced)} slash commands globally")
-
-            # Log the synced commands
-            for command in synced:
-                logger.info(f"Synced command: /{command.name}")
-
-        except discord.HTTPException as e:
-            logger.error(f"HTTP error syncing slash commands: {e}")
-            if e.status == 429:
-                logger.error("Rate limited - commands may have been synced recently")
-            elif e.status == 403:
-                logger.error("Bot lacks permissions to sync commands")
-            else:
-                logger.error(f"HTTP {e.status}: {e.text}")
-        except Exception as e:
-            logger.error(f"Failed to sync slash commands: {e}")
-            logger.error("Commands may not be available until next bot restart")
-
-        # Initialize last pub date from history if not set
-        if self.last_pub_date is None and self.status_history:
-            last_entry = self.status_history[-1]
-            self.last_pub_date = last_entry.get("pub_date")
-            logger.info(f"Initialized last pub date from history: {self.last_pub_date}")
-
+        
         if not self.check_rss_feeds.is_running():
             self.check_rss_feeds.start()
-
-    async def on_command_error(self, ctx, error):
-        """Handle legacy command errors (if any remain)"""
-        logger.error(f"Legacy command error: {error}")
-
-    async def on_app_command_error(
-        self, interaction: discord.Interaction, error: app_commands.AppCommandError
-    ):
-        """Handle application command errors"""
-        if isinstance(error, app_commands.CommandSignatureMismatch):
-            logger.error(
-                f"Command signature mismatch for {interaction.command.name}: {error}"
-            )
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ Command signature mismatch. The bot may need to resync commands.",
-                    ephemeral=True,
-                )
-        elif isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "❌ You don't have permission to use this command", ephemeral=True
-            )
-        elif isinstance(error, app_commands.CommandOnCooldown):
-            await interaction.response.send_message(
-                f"❌ Command is on cooldown. Try again in {error.retry_after:.1f}s",
-                ephemeral=True,
-            )
-        else:
-            logger.error(f"App command error: {error}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    f"❌ An error occurred: {error}", ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    f"❌ An error occurred: {error}", ephemeral=True
-                )
-
-    # === RSS FEED MANAGEMENT CALLBACKS ===
-    
-    @app_commands.choices(parser_type=[
-        app_commands.Choice(name="Generic RSS", value="generic"),
-        app_commands.Choice(name="Field Status", value="field_status"),
-        app_commands.Choice(name="Custom", value="custom")
-    ])
-    async def add_feed_callback(
-        self,
-        interaction: discord.Interaction,
-        name: str,
-        url: str,
-        channel: discord.TextChannel,
-        parser_type: str = "generic"
-    ):
-        """Add a new RSS feed to monitor"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        # Generate a unique feed ID
-        feed_id = name.lower().replace(" ", "_").replace("-", "_")
-        counter = 1
-        original_feed_id = feed_id
-        while feed_id in guild_config["feeds"]:
-            feed_id = f"{original_feed_id}_{counter}"
-            counter += 1
-        
-        # Create default feed config
-        default_feed_config = {
-            "name": name,
-            "url": url,
-            "channel_id": channel.id,
-            "enabled": True,
-            "check_intervals": {
-                "normal": 20,
-                "peak": 5,
-                "frequent": 1,
-                "weather": 5
-            },
-            "schedule": {
-                "peak_times": [],
-                "weather_check": False,
-                "weather_location": ""
-            },
-            "processing": {
-                "content_parser": parser_type,
-                "custom_parser_function": None,
-                "filters": [],
-                "status_colors": {
-                    "default": 0x3498DB,
-                    "success": 0x00FF00,
-                    "warning": 0xFF8C00,
-                    "error": 0xFF0000
-                }
-            },
-            "embed_template": {
-                "title_template": "{title}",
-                "description_template": "{content}",
-                "footer_text": "RSS Feed Update",
-                "thumbnail_url": None,
-                "fields": []
-            },
-            "history": {
-                "enabled": True,
-                "max_entries": 100,
-                "file_path": f"feed_history_{guild_id}_{feed_id}.json"
-            }
-        }
-        
-        # Add the feed to the guild config
-        guild_config["feeds"][feed_id] = default_feed_config
-        self.save_config()
-        
-        embed = discord.Embed(
-            title="✅ RSS Feed Added",
-            color=0x00FF00,
-            description=f"Successfully added RSS feed **{name}**"
-        )
-        embed.add_field(name="Feed ID", value=feed_id, inline=True)
-        embed.add_field(name="URL", value=url, inline=False)
-        embed.add_field(name="Channel", value=channel.mention, inline=True)
-        embed.add_field(name="Parser", value=parser_type, inline=True)
-        embed.add_field(name="Status", value="Enabled", inline=True)
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def list_feeds_callback(self, interaction: discord.Interaction):
-        """List all RSS feeds configured for this server"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if not guild_config["feeds"]:
-            await interaction.response.send_message(
-                "❌ No RSS feeds configured for this server.", ephemeral=True
-            )
-            return
-        
-        embed = discord.Embed(
-            title="📡 RSS Feeds",
-            color=0x3498DB,
-            description=f"Configured feeds for **{interaction.guild.name}**"
-        )
-        
-        for feed_id, feed_config in guild_config["feeds"].items():
-            status = "✅ Enabled" if feed_config["enabled"] else "❌ Disabled"
-            channel = self.get_channel(feed_config["channel_id"])
-            channel_name = channel.mention if channel else "Unknown Channel"
-            
-            embed.add_field(
-                name=f"{feed_config['name']} ({feed_id})",
-                value=f"**URL:** {feed_config['url'][:50]}...\n**Channel:** {channel_name}\n**Status:** {status}\n**Parser:** {feed_config['processing']['content_parser']}",
-                inline=False
-            )
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def remove_feed_callback(self, interaction: discord.Interaction, feed_id: str):
-        """Remove an RSS feed"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if feed_id not in guild_config["feeds"]:
-            await interaction.response.send_message(
-                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.", 
-                ephemeral=True
-            )
-            return
-        
-        feed_name = guild_config["feeds"][feed_id]["name"]
-        del guild_config["feeds"][feed_id]
-        self.save_config()
-        
-        await interaction.response.send_message(
-            f"✅ Successfully removed RSS feed **{feed_name}** (`{feed_id}`)", 
-            ephemeral=True
-        )
-
-    async def toggle_feed_callback(self, interaction: discord.Interaction, feed_id: str):
-        """Enable or disable an RSS feed"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if feed_id not in guild_config["feeds"]:
-            await interaction.response.send_message(
-                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.", 
-                ephemeral=True
-            )
-            return
-        
-        feed_config = guild_config["feeds"][feed_id]
-        feed_config["enabled"] = not feed_config["enabled"]
-        self.save_config()
-        
-        status = "enabled" if feed_config["enabled"] else "disabled"
-        emoji = "✅" if feed_config["enabled"] else "❌"
-        
-        await interaction.response.send_message(
-            f"{emoji} RSS feed **{feed_config['name']}** (`{feed_id}`) has been {status}", 
-            ephemeral=True
-        )
-
-    async def feed_config_callback(self, interaction: discord.Interaction, feed_id: str):
-        """View RSS feed configuration"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if feed_id not in guild_config["feeds"]:
-            await interaction.response.send_message(
-                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.", 
-                ephemeral=True
-            )
-            return
-        
-        feed_config = guild_config["feeds"][feed_id]
-        channel = self.get_channel(feed_config["channel_id"])
-        
-        embed = discord.Embed(
-            title=f"⚙️ Feed Configuration: {feed_config['name']}",
-            color=0x3498DB
-        )
-        
-        embed.add_field(name="Feed ID", value=feed_id, inline=True)
-        embed.add_field(name="Status", value="✅ Enabled" if feed_config["enabled"] else "❌ Disabled", inline=True)
-        embed.add_field(name="Channel", value=channel.mention if channel else "Unknown", inline=True)
-        
-        embed.add_field(name="RSS URL", value=feed_config["url"], inline=False)
-        embed.add_field(name="Parser Type", value=feed_config["processing"]["content_parser"], inline=True)
-        
-        intervals = feed_config["check_intervals"]
-        interval_text = f"Normal: {intervals['normal']}m | Peak: {intervals['peak']}m | Frequent: {intervals['frequent']}m"
-        embed.add_field(name="Check Intervals", value=interval_text, inline=False)
-        
-        embed.add_field(
-            name="History", 
-            value=f"{'✅ Enabled' if feed_config['history']['enabled'] else '❌ Disabled'} (Max: {feed_config['history']['max_entries']})", 
-            inline=True
-        )
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            logger.info("Started RSS feed monitoring task")
 
 
 # Bot setup and run
