@@ -657,54 +657,55 @@ class FieldStatusBot(commands.Bot):
             pub_date = latest_entry.get("published", "")
             title = latest_entry.get("title", "RSS Update")
 
-            # ── Dedup check ───────────────────────────────────────────────────
-            feed_key = f"{guild_id}:{feed_id}"
             guild_id_str = str(guild_id)
+            feed_key = f"{guild_id}:{feed_id}"
 
+            # ── Dedup: always read from DB so restarts don't re-post ──────────
             if self.db:
-                # Fast pre-check against in-memory cache — avoids a DB round-trip
-                # on the common case where nothing has changed.
-                if self._feed_last_pub_dates.get(feed_key) == pub_date:
-                    logger.debug(f"No new update for {feed_id} (cache hit)")
-                    return
-
-                # Atomically claim this pub_date in the DB.
-                # If another instance already claimed it (zero-downtime deploy overlap),
-                # claim_pub_date returns False and we skip posting entirely.
-                is_new = await self.db.claim_pub_date(guild_id_str, feed_id, pub_date)
-                if not is_new:
-                    logger.debug(f"pub_date {pub_date!r} already claimed for {feed_id} — skipping")
-                    self._feed_last_pub_dates[feed_key] = pub_date
-                    return
-
-                self._feed_last_pub_dates[feed_key] = pub_date
+                last_pub_date = await self.db.get_last_pub_date(guild_id_str, feed_id)
             else:
-                if self._feed_last_pub_dates.get(feed_key) == pub_date:
-                    logger.debug(f"No new update for {feed_id} (pub_date unchanged)")
-                    return
+                last_pub_date = self._feed_last_pub_dates.get(feed_key)
+
+            logger.info(
+                f"[{feed_id}] feed pub_date={pub_date!r}  db last={last_pub_date!r}"
+            )
+
+            if pub_date == last_pub_date:
+                logger.debug(f"[{feed_id}] No change — skipping")
+                return
+
+            # Persist new pub_date BEFORE posting so a crash after send
+            # doesn't cause a re-post on next restart.
+            if self.db:
+                await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
+            else:
                 self._feed_last_pub_dates[feed_key] = pub_date
 
-            logger.info(f"New RSS update for {feed_id}: {pub_date!r}")
+            logger.info(f"[{feed_id}] New entry detected — processing")
 
-            # ── Parse & determine previous status for change detection ────────
-            previous_status = await self.db.get_last_status(guild_id_str, feed_id) if self.db else None
-
+            # ── Parse ─────────────────────────────────────────────────────────
+            previous_status = (
+                await self.db.get_last_status(guild_id_str, feed_id)
+                if self.db else None
+            )
             parsed_data = await self.parse_feed_content(
                 feed_config, content, title, latest_entry, previous_status
             )
 
-            # ── Post to Discord ───────────────────────────────────────────────
+            # ── Post ──────────────────────────────────────────────────────────
             if parsed_data.get("should_post", True):
                 embed = await self.create_feed_embed(feed_config, parsed_data, pub_date)
                 channel = self.get_channel(feed_config["channel_id"])
                 if channel:
                     guild_config = self.get_guild_config(guild_id)
                     await self.send_feed_update(channel, embed, guild_config["role_pings"])
-                    logger.info(f"Posted update for {feed_id} to #{channel.name}")
+                    logger.info(f"[{feed_id}] Posted to #{channel.name}")
                 else:
-                    logger.error(f"Channel {feed_config['channel_id']} not found for {feed_id}")
+                    logger.error(f"[{feed_id}] Channel {feed_config['channel_id']} not found")
+            else:
+                logger.info(f"[{feed_id}] Update seen but should_post=False (status unchanged)")
 
-            # ── Save history ──────────────────────────────────────────────────
+            # ── History ───────────────────────────────────────────────────────
             if self.db and feed_config["history"]["enabled"]:
                 await self.db.add_history_entry(guild_id_str, feed_id, {
                     "pub_date": pub_date,
@@ -716,7 +717,7 @@ class FieldStatusBot(commands.Bot):
                 })
 
         except Exception as e:
-            logger.error(f"Error processing RSS feed {feed_id}: {e}")
+            logger.error(f"Error processing RSS feed {feed_id}: {e}", exc_info=True)
 
     async def fetch_rss_feed_url(self, url: str):
         """Fetch RSS feed from a specific URL"""
@@ -884,14 +885,13 @@ class FieldStatusBot(commands.Bot):
                 for guild_id, guild_config in stored.items():
                     self.config["guilds"][guild_id] = guild_config
                 self._apply_config_defaults(self.config)
-                # Pre-warm the pub-date cache so the first check loop is instant
-                self._feed_last_pub_dates = await self.db.load_all_feed_states()
+                feed_states = await self.db.load_all_feed_states()
                 logger.info(
-                    f"Loaded {len(stored)} guild config(s) and "
-                    f"{len(self._feed_last_pub_dates)} feed state(s) from DB"
+                    f"DB startup: {len(stored)} guild config(s), "
+                    f"{len(feed_states)} feed state(s): {feed_states}"
                 )
             except Exception as e:
-                logger.error(f"Failed to connect to database: {e} — falling back to JSON")
+                logger.error(f"Failed to connect to database: {e} — falling back to JSON", exc_info=True)
                 self.db = None
                 self.config = self._load_config_from_json()
         else:
