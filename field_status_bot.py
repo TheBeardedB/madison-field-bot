@@ -877,23 +877,29 @@ class FieldStatusBot(commands.Bot):
         """Connect to DB (if configured), load persistent state, register commands."""
         db_url = os.getenv("DATABASE_URL")
         if db_url:
+            # Step 1: connect (if this fails, fall back to JSON entirely)
             try:
                 self.db = Database(db_url)
                 await self.db.connect()
-                # Load all guild configs from DB into memory
-                stored = await self.db.load_all_guild_configs()
-                for guild_id, guild_config in stored.items():
-                    self.config["guilds"][guild_id] = guild_config
-                self._apply_config_defaults(self.config)
-                feed_states = await self.db.load_all_feed_states()
-                logger.info(
-                    f"DB startup: {len(stored)} guild config(s), "
-                    f"{len(feed_states)} feed state(s): {feed_states}"
-                )
+                logger.info("Database connected")
             except Exception as e:
                 logger.error(f"Failed to connect to database: {e} — falling back to JSON", exc_info=True)
                 self.db = None
-                self.config = self._load_config_from_json()
+
+            # Step 2: load state (if this fails, keep self.db so future writes work)
+            if self.db:
+                try:
+                    stored = await self.db.load_all_guild_configs()
+                    for guild_id, guild_config in stored.items():
+                        self.config["guilds"][guild_id] = guild_config
+                    self._apply_config_defaults(self.config)
+                    feed_states = await self.db.load_all_feed_states()
+                    logger.info(
+                        f"DB startup: {len(stored)} guild config(s), "
+                        f"{len(feed_states)} feed state(s): {feed_states}"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to load state from DB: {e} — starting fresh (DB still active)", exc_info=True)
         else:
             logger.info("No DATABASE_URL set — using local JSON files")
             self.config = self._load_config_from_json()
@@ -1346,60 +1352,6 @@ class FieldStatusBot(commands.Bot):
     async def on_ready(self):
         """Called when bot is ready"""
         logger.info(f"Bot logged in as {self.user.name} ({self.user.id})")
-
-        # Auto-configure the Madison field status feed for the one guild that
-        # owns the target channel.  Iterating all guilds caused a post per guild
-        # when the bot was in more than one server.
-        rss_url = os.getenv("RSS_FEED_URL", "https://www.madisonal.gov/RSSFeed.aspx?ModID=1&CID=Field-Status-6")
-        channel_id = self.CHANNEL_ID
-
-        if channel_id:
-            target_channel = self.get_channel(channel_id)
-            if target_channel is None:
-                logger.warning(
-                    f"DISCORD_CHANNEL_ID {channel_id} not found — "
-                    "bot may not be in that server yet, or the ID is wrong"
-                )
-            else:
-                guild = target_channel.guild
-                guild_config = self.get_guild_config(guild.id)
-                if "madison_field_status" not in guild_config["feeds"]:
-                    logger.info(f"Auto-configuring Madison field status feed for guild '{guild.name}'")
-                    guild_config["feeds"]["madison_field_status"] = {
-                        "name": "Madison Field Status",
-                        "url": rss_url,
-                        "channel_id": channel_id,
-                        "enabled": True,
-                        "check_intervals": {"normal": 20, "peak": 5, "frequent": 1, "weather": 5},
-                        "schedule": {
-                            "peak_times": [
-                                {"start": "14:30", "end": "15:30", "days": [0, 1, 2, 3, 4]},
-                                {"start": "07:30", "end": "08:30", "days": [5, 6]},
-                            ],
-                            "weather_check": False,
-                            "weather_location": "",
-                        },
-                        "processing": {
-                            "content_parser": "field_status",
-                            "custom_parser_function": None,
-                            "filters": [],
-                            "status_colors": {
-                                "default": 0x3498DB,
-                                "success": 0x00FF00,
-                                "warning": 0xFF8C00,
-                                "error": 0xFF0000,
-                            },
-                        },
-                        "embed_template": {
-                            "title_template": "{title}",
-                            "description_template": "{content}",
-                            "footer_text": "Madison Parks & Recreation",
-                            "thumbnail_url": None,
-                            "fields": [],
-                        },
-                        "history": {"enabled": True, "max_entries": 100},
-                    }
-                    self.save_config()
 
         # Sync slash commands
         try:

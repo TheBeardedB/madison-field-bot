@@ -59,7 +59,14 @@ class Database:
     async def load_all_guild_configs(self) -> Dict[str, Dict]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("SELECT guild_id, config FROM guild_configs")
-            return {row["guild_id"]: dict(row["config"]) for row in rows}
+            result = {}
+            for row in rows:
+                try:
+                    cfg = row["config"]
+                    result[row["guild_id"]] = dict(cfg) if cfg else {}
+                except Exception as e:
+                    logger.error(f"Skipping malformed config for guild {row['guild_id']}: {e}")
+            return result
 
     async def save_guild_config(self, guild_id: str, config: Dict):
         async with self.pool.acquire() as conn:
@@ -85,6 +92,19 @@ class Database:
             )
             return row["last_pub_date"] if row else None
 
+    async def set_last_pub_date(self, guild_id: str, feed_id: str, pub_date: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO feed_state (guild_id, feed_id, last_pub_date, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (guild_id, feed_id) DO UPDATE
+                    SET last_pub_date = $3, updated_at = NOW()
+                """,
+                guild_id,
+                feed_id,
+                pub_date,
+            )
 
     async def load_all_feed_states(self) -> Dict[str, str]:
         """Return {'{guild_id}:{feed_id}': last_pub_date} for all feeds."""
