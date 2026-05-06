@@ -405,21 +405,23 @@ class FieldStatusBot(commands.Bot):
         contains_soccer: bool,
         previous_status: Optional[str],
     ) -> bool:
-        """Determine if an update should be posted based on criteria"""
-
-        # Fields have reopened after being closed
-        if previous_status in ["closed", "partial"] and status == "open":
-            return True
-
-        # Any time soccer fields are closed
-        if contains_soccer and any(
-            "soccer" in field.lower() for field in closed_fields
-        ):
-            return True
-
-        # All fields are closed
+        """
+        Return True when a city update is worth announcing.
+        pub-date dedup ensures this is only called once per new RSS entry.
+        """
+        # Always announce every new closed update (city may have new details)
         if status == "closed":
             return True
+
+        # Announce when fields reopen after being closed or partial
+        if status == "open":
+            return previous_status in ("closed", "partial")
+
+        # For partial closures, only announce when soccer fields are affected
+        if status == "partial":
+            return contains_soccer and any(
+                "soccer" in field.lower() for field in closed_fields
+            )
 
         return False
 
@@ -1345,33 +1347,37 @@ class FieldStatusBot(commands.Bot):
         """Called when bot is ready"""
         logger.info(f"Bot logged in as {self.user.name} ({self.user.id})")
 
-        # Auto-configure the Madison field status feed from env vars for all guilds
+        # Auto-configure the Madison field status feed for the one guild that
+        # owns the target channel.  Iterating all guilds caused a post per guild
+        # when the bot was in more than one server.
         rss_url = os.getenv("RSS_FEED_URL", "https://www.madisonal.gov/RSSFeed.aspx?ModID=1&CID=Field-Status-6")
         channel_id = self.CHANNEL_ID
 
         if channel_id:
-            for guild in self.guilds:
+            target_channel = self.get_channel(channel_id)
+            if target_channel is None:
+                logger.warning(
+                    f"DISCORD_CHANNEL_ID {channel_id} not found — "
+                    "bot may not be in that server yet, or the ID is wrong"
+                )
+            else:
+                guild = target_channel.guild
                 guild_config = self.get_guild_config(guild.id)
                 if "madison_field_status" not in guild_config["feeds"]:
-                    logger.info(f"Auto-configuring Madison field status feed for guild {guild.name}")
+                    logger.info(f"Auto-configuring Madison field status feed for guild '{guild.name}'")
                     guild_config["feeds"]["madison_field_status"] = {
                         "name": "Madison Field Status",
                         "url": rss_url,
                         "channel_id": channel_id,
                         "enabled": True,
-                        "check_intervals": {
-                            "normal": 20,
-                            "peak": 5,
-                            "frequent": 1,
-                            "weather": 5
-                        },
+                        "check_intervals": {"normal": 20, "peak": 5, "frequent": 1, "weather": 5},
                         "schedule": {
                             "peak_times": [
                                 {"start": "14:30", "end": "15:30", "days": [0, 1, 2, 3, 4]},
-                                {"start": "07:30", "end": "08:30", "days": [5, 6]}
+                                {"start": "07:30", "end": "08:30", "days": [5, 6]},
                             ],
                             "weather_check": False,
-                            "weather_location": ""
+                            "weather_location": "",
                         },
                         "processing": {
                             "content_parser": "field_status",
@@ -1381,21 +1387,17 @@ class FieldStatusBot(commands.Bot):
                                 "default": 0x3498DB,
                                 "success": 0x00FF00,
                                 "warning": 0xFF8C00,
-                                "error": 0xFF0000
-                            }
+                                "error": 0xFF0000,
+                            },
                         },
                         "embed_template": {
                             "title_template": "{title}",
                             "description_template": "{content}",
                             "footer_text": "Madison Parks & Recreation",
                             "thumbnail_url": None,
-                            "fields": []
+                            "fields": [],
                         },
-                        "history": {
-                            "enabled": True,
-                            "max_entries": 100,
-                            "file_path": None
-                        }
+                        "history": {"enabled": True, "max_entries": 100},
                     }
                     self.save_config()
 
