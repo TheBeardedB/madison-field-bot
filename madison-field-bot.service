@@ -1,0 +1,18 @@
+[Unit]
+Description=Madison Field Status Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=your-username
+WorkingDirectory=/path/to/madison-field-bot
+Environment=DISCORD_BOT_TOKEN=your_token_here
+Environment=DISCORD_CHANNEL_ID=your_channel_id_here
+ExecStart=/path/to/madison-field-bot/venv/bin/python field_status_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
