@@ -660,21 +660,32 @@ class FieldStatusBot(commands.Bot):
             guild_id_str = str(guild_id)
 
             if self.db:
-                last_pub_date = await self.db.get_last_pub_date(guild_id_str, feed_id)
+                # Fast pre-check against in-memory cache — avoids a DB round-trip
+                # on the common case where nothing has changed.
+                if self._feed_last_pub_dates.get(feed_key) == pub_date:
+                    logger.debug(f"No new update for {feed_id} (cache hit)")
+                    return
+
+                # Atomically claim this pub_date in the DB.
+                # If another instance already claimed it (zero-downtime deploy overlap),
+                # claim_pub_date returns False and we skip posting entirely.
+                is_new = await self.db.claim_pub_date(guild_id_str, feed_id, pub_date)
+                if not is_new:
+                    logger.debug(f"pub_date {pub_date!r} already claimed for {feed_id} — skipping")
+                    self._feed_last_pub_dates[feed_key] = pub_date
+                    return
+
+                self._feed_last_pub_dates[feed_key] = pub_date
             else:
-                last_pub_date = self._feed_last_pub_dates.get(feed_key)
+                if self._feed_last_pub_dates.get(feed_key) == pub_date:
+                    logger.debug(f"No new update for {feed_id} (pub_date unchanged)")
+                    return
+                self._feed_last_pub_dates[feed_key] = pub_date
 
-            if pub_date == last_pub_date:
-                logger.debug(f"No new update for {feed_id} (pub_date unchanged)")
-                return
-
-            logger.info(f"New RSS update for {feed_id}: {pub_date!r} (was {last_pub_date!r})")
+            logger.info(f"New RSS update for {feed_id}: {pub_date!r}")
 
             # ── Parse & determine previous status for change detection ────────
-            if self.db:
-                previous_status = await self.db.get_last_status(guild_id_str, feed_id)
-            else:
-                previous_status = None  # can't look back without DB
+            previous_status = await self.db.get_last_status(guild_id_str, feed_id) if self.db else None
 
             parsed_data = await self.parse_feed_content(
                 feed_config, content, title, latest_entry, previous_status
@@ -691,20 +702,16 @@ class FieldStatusBot(commands.Bot):
                 else:
                     logger.error(f"Channel {feed_config['channel_id']} not found for {feed_id}")
 
-            # ── Persist state ─────────────────────────────────────────────────
-            if self.db:
-                await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
-                if feed_config["history"]["enabled"]:
-                    await self.db.add_history_entry(guild_id_str, feed_id, {
-                        "pub_date": pub_date,
-                        "title": title,
-                        "content": content[:2000],
-                        "status": parsed_data.get("status"),
-                        "closed_fields": parsed_data.get("closed_fields", []),
-                        "contains_soccer": parsed_data.get("contains_soccer", False),
-                    })
-            else:
-                self._feed_last_pub_dates[feed_key] = pub_date
+            # ── Save history ──────────────────────────────────────────────────
+            if self.db and feed_config["history"]["enabled"]:
+                await self.db.add_history_entry(guild_id_str, feed_id, {
+                    "pub_date": pub_date,
+                    "title": title,
+                    "content": content[:2000],
+                    "status": parsed_data.get("status"),
+                    "closed_fields": parsed_data.get("closed_fields", []),
+                    "contains_soccer": parsed_data.get("contains_soccer", False),
+                })
 
         except Exception as e:
             logger.error(f"Error processing RSS feed {feed_id}: {e}")

@@ -85,19 +85,32 @@ class Database:
             )
             return row["last_pub_date"] if row else None
 
-    async def set_last_pub_date(self, guild_id: str, feed_id: str, pub_date: str):
+    async def claim_pub_date(self, guild_id: str, feed_id: str, pub_date: str) -> bool:
+        """
+        Atomically advance last_pub_date to pub_date.
+        Returns True if this caller should post (the pub_date is new).
+        Returns False if another instance already claimed it — skip posting.
+
+        Uses a conditional upsert so concurrent instances can't both win:
+          INSERT ... ON CONFLICT DO UPDATE ... WHERE last_pub_date IS DISTINCT FROM new_value
+        If the value is already set (second instance), no rows are touched → "UPDATE 0".
+        """
         async with self.pool.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 """
                 INSERT INTO feed_state (guild_id, feed_id, last_pub_date, updated_at)
                 VALUES ($1, $2, $3, NOW())
                 ON CONFLICT (guild_id, feed_id) DO UPDATE
-                    SET last_pub_date = $3, updated_at = NOW()
+                    SET last_pub_date = EXCLUDED.last_pub_date,
+                        updated_at    = NOW()
+                WHERE feed_state.last_pub_date IS DISTINCT FROM EXCLUDED.last_pub_date
                 """,
                 guild_id,
                 feed_id,
                 pub_date,
             )
+        # asyncpg returns e.g. "INSERT 0 1", "UPDATE 1", or "UPDATE 0"
+        return result != "UPDATE 0"
 
     async def load_all_feed_states(self) -> Dict[str, str]:
         """Return {'{guild_id}:{feed_id}': last_pub_date} for all feeds."""
