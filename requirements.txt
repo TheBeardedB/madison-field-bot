@@ -3,3 +3,4 @@ feedparser>=6.0.10
 aiohttp>=3.8.0
 pytz>=2023.3
 python-dotenv>=1.0.0
+asyncpg>=0.29.0

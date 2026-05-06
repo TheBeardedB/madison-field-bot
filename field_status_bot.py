@@ -1,60 +1,57 @@
 import os
-# Set environment variable for Python to use UTF-8
-os.environ['PYTHONIOENCODING'] = 'utf-8'
+import sys
+import logging
+import re
+import json
+import asyncio
+import random
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import tasks, commands
 from discord import app_commands
 import feedparser
-import json
-import logging
-import re
-import asyncio
-from datetime import datetime, timedelta
 import pytz
 import aiohttp
-from typing import Dict, List, Optional, Tuple
-import random
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+from db import Database
+
 load_dotenv()
 
-# Set console encoding to UTF-8 for Windows
-if os.name == 'nt':  # Windows
+# On Windows, request UTF-8 console output
+if os.name == 'nt':
+    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
     try:
         import subprocess
         subprocess.run(['chcp', '65001'], shell=True, capture_output=True)
-    except:
-        pass  # Ignore if chcp fails
+    except Exception:
+        pass
 
-# Configure logging with proper Unicode handling
-import sys
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-# Create file handler with UTF-8 encoding
-file_handler = logging.FileHandler("field_status_bot.log", encoding='utf-8')
-file_handler.setLevel(logging.INFO)
-
-# Create console handler with UTF-8 encoding (fallback for Windows)
+console_handler = logging.StreamHandler(sys.stdout)
 try:
-    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.stream.reconfigure(encoding='utf-8')
 except (AttributeError, OSError):
-    # Fallback for older Python or systems that don't support reconfigure
-    console_handler = logging.StreamHandler(sys.stdout)
-
+    pass
 console_handler.setLevel(logging.INFO)
-
-# Set formatter
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
 
-# Configure root logger
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
-root_logger.addHandler(file_handler)
 root_logger.addHandler(console_handler)
+
+# Add a file handler when running locally (Railway provides ephemeral disk; not worth persisting)
+if not os.getenv("RAILWAY_ENVIRONMENT"):
+    try:
+        file_handler = logging.FileHandler("field_status_bot.log", encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    except OSError:
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -89,237 +86,117 @@ class FieldStatusBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="/", intents=intents)
 
-        # Configuration
+        self.CST = pytz.timezone("US/Central")
+        self.CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
         self.CONFIG_FILE = "bot_config.json"
 
-        # Load configuration (role pings, etc.)
-        self.config = self.load_config()
+        # Populated in setup_hook from DB (Railway) or JSON file (local)
+        self.config: Dict = {"guilds": {}}
+        # {'{guild_id}:{feed_id}': last_pub_date} — in-memory cache, backed by DB
+        self._feed_last_pub_dates: Dict[str, str] = {}
+        # Database handle; None when running without DATABASE_URL
+        self.db: Optional[Database] = None
 
-        # Default timezone (can be overridden per guild)
-        self.CST = pytz.timezone("US/Central")
-
-        # Legacy fields for backward compatibility during migration
-        self.CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
-        self.HISTORY_FILE = "field_status_history.json"
-        self.current_status = None
-        self.last_pub_date = None
-        self.status_history = self.load_history()
-        self.next_expected_update = None
-
-        # Color mapping
         self.STATUS_COLORS = {
-            "open": 0x00FF00,  # Green
-            "partial": 0xFF8C00,  # Orange
-            "closed": 0xFF0000,  # Red
+            "open": 0x00FF00,
+            "partial": 0xFF8C00,
+            "closed": 0xFF0000,
         }
 
-    def load_history(self) -> List[Dict]:
-        """Load status history from file"""
-        try:
-            if os.path.exists(self.HISTORY_FILE):
-                with open(self.HISTORY_FILE, "r") as f:
-                    data = json.load(f)
-                    # If it's the old format (just a list), convert it
-                    if isinstance(data, list):
-                        history = data
-                        # Try to get last pub date from most recent entry
-                        if history:
-                            last_entry = history[-1]
-                            self.last_pub_date = last_entry.get("pub_date")
-                            logger.info(
-                                f"Loaded last pub date from history: {self.last_pub_date}"
-                            )
-                        return history
-                    # New format with metadata
-                    else:
-                        self.last_pub_date = data.get("last_pub_date")
-                        logger.info(
-                            f"Loaded last pub date from metadata: {self.last_pub_date}"
-                        )
-                        return data.get("history", [])
-        except Exception as e:
-            logger.error(f"Error loading history: {e}")
-        return []
+    # ── Config helpers ────────────────────────────────────────────────────────
 
-    def load_config(self) -> Dict:
-        """Load bot configuration from file"""
-        default_config = {
-            "guilds": {}  # Format: {guild_id: guild_config}
-        }
-        
-        # Default guild config structure
-        default_guild_config = {
-            "feeds": {},  # Format: {feed_id: feed_config}
-            "role_pings": {},  # Format: {channel_id: [role_id1, role_id2, ...]}
-            "global_settings": {
-                "timezone": "US/Central",
-                "default_embed_color": 0x3498DB
-            }
-        }
-        
-        # Default feed config structure
-        default_feed_config = {
-            "name": "RSS Feed",
-            "url": "",
-            "channel_id": None,
-            "enabled": True,
-            "check_intervals": {
-                "normal": 20,  # minutes
-                "peak": 5,     # minutes
-                "frequent": 1,  # minute (for expected updates)
-                "weather": 5   # minutes (for weather-based)
-            },
-            "schedule": {
-                "peak_times": [  # Format: [{"start": "14:30", "end": "15:30", "days": [0,1,2,3,4]}]
-                    {"start": "14:30", "end": "15:30", "days": [0,1,2,3,4]},  # Weekdays 2:30-3:30 PM
-                    {"start": "07:30", "end": "08:30", "days": [5,6]}         # Weekends 7:30-8:30 AM
-                ],
-                "weather_check": False,  # Enable weather-based checking
-                "weather_location": ""   # Location for weather checks
-            },
-            "processing": {
-                "content_parser": "generic",  # "generic", "field_status", "custom"
-                "custom_parser_function": None,
-                "filters": [],  # List of filters to apply
-                "status_colors": {
-                    "default": 0x3498DB,
-                    "success": 0x00FF00,
-                    "warning": 0xFF8C00,
-                    "error": 0xFF0000
-                }
-            },
-            "embed_template": {
-                "title_template": "{title}",
-                "description_template": "{content}",
-                "footer_text": "RSS Feed Update",
-                "thumbnail_url": None,
-                "fields": []  # Custom fields to add
-            },
-            "history": {
-                "enabled": True,
-                "max_entries": 100,
-                "file_path": None  # Will be auto-generated if None
-            }
-        }
+    DEFAULT_GUILD_CONFIG = {
+        "feeds": {},
+        "role_pings": {},
+        "global_settings": {"timezone": "US/Central", "default_embed_color": 0x3498DB},
+    }
 
+    DEFAULT_FEED_CONFIG = {
+        "name": "RSS Feed",
+        "url": "",
+        "channel_id": None,
+        "enabled": True,
+        "check_intervals": {"normal": 20, "peak": 5, "frequent": 1, "weather": 5},
+        "schedule": {
+            "peak_times": [
+                {"start": "14:30", "end": "15:30", "days": [0, 1, 2, 3, 4]},
+                {"start": "07:30", "end": "08:30", "days": [5, 6]},
+            ],
+            "weather_check": False,
+            "weather_location": "",
+        },
+        "processing": {
+            "content_parser": "generic",
+            "custom_parser_function": None,
+            "filters": [],
+            "status_colors": {
+                "default": 0x3498DB,
+                "success": 0x00FF00,
+                "warning": 0xFF8C00,
+                "error": 0xFF0000,
+            },
+        },
+        "embed_template": {
+            "title_template": "{title}",
+            "description_template": "{content}",
+            "footer_text": "RSS Feed Update",
+            "thumbnail_url": None,
+            "fields": [],
+        },
+        "history": {"enabled": True, "max_entries": 100},
+    }
+
+    def _apply_config_defaults(self, config: Dict) -> Dict:
+        """Fill in any missing keys on a loaded config dict."""
+        for guild_id, guild_config in config.get("guilds", {}).items():
+            for k, v in self.DEFAULT_GUILD_CONFIG.items():
+                if k not in guild_config:
+                    guild_config[k] = v
+            for feed_id, feed_config in guild_config.get("feeds", {}).items():
+                for k, v in self.DEFAULT_FEED_CONFIG.items():
+                    if k not in feed_config:
+                        feed_config[k] = v
+        return config
+
+    def _load_config_from_json(self) -> Dict:
+        """Load config from local JSON file (used when no DATABASE_URL)."""
         try:
             if os.path.exists(self.CONFIG_FILE):
-                with open(self.CONFIG_FILE, "r", encoding='utf-8') as f:
+                with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
                     config = json.load(f)
-                    
-                    # Migration from old config format
-                    if "role_pings" in config and "guilds" not in config:
-                        logger.info("Migrating from old config format to new guild-based format")
-                        # Create a default guild entry with the old config
-                        guild_id = str(self.guilds[0].id) if self.guilds else "default"
-                        migrated_config = {
-                            "guilds": {
-                                guild_id: {
-                                    "feeds": {
-                                        "default_feed": {
-                                            **default_feed_config,
-                                            "name": "Madison Field Status",
-                                            "url": "https://www.madisonal.gov/RSSFeed.aspx?ModID=1&CID=Field-Status-6",
-                                            "channel_id": self.CHANNEL_ID,
-                                            "processing": {
-                                                **default_feed_config["processing"],
-                                                "content_parser": "field_status"
-                                            }
-                                        }
-                                    },
-                                    "role_pings": config.get("role_pings", {}),
-                                    "global_settings": default_guild_config["global_settings"]
-                                }
-                            }
-                        }
-                        config = migrated_config
-                        # Save the migrated config
-                        self.save_config_data(config)
-                    
-                    # Ensure all guild configs have required structure
-                    if "guilds" in config:
-                        for guild_id, guild_config in config["guilds"].items():
-                            # Merge with default guild config
-                            for key, value in default_guild_config.items():
-                                if key not in guild_config:
-                                    guild_config[key] = value
-                            
-                            # Ensure all feeds have required structure
-                            for feed_id, feed_config in guild_config["feeds"].items():
-                                for key, value in default_feed_config.items():
-                                    if key not in feed_config:
-                                        feed_config[key] = value
-                    
-                    return config
+                return self._apply_config_defaults(config)
         except Exception as e:
-            logger.error(f"Error loading config: {e}")
+            logger.error(f"Error loading config from JSON: {e}")
+        return {"guilds": {}}
 
-        return default_config
+    def _save_config_to_json(self):
+        """Write config to local JSON file."""
+        try:
+            with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving config to JSON: {e}")
 
     def save_config(self):
-        """Save bot configuration to file"""
-        self.save_config_data(self.config)
-    
-    def save_config_data(self, config_data):
-        """Save specific config data to file"""
-        try:
-            with open(self.CONFIG_FILE, "w", encoding='utf-8') as f:
-                json.dump(config_data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving config: {e}")
+        """Persist config — DB when available, JSON file otherwise."""
+        if self.db:
+            for guild_id, guild_config in self.config["guilds"].items():
+                asyncio.create_task(self.db.save_guild_config(guild_id, guild_config))
+        else:
+            self._save_config_to_json()
     
     def get_guild_config(self, guild_id: int) -> Dict:
-        """Get configuration for a specific guild"""
+        """Return (and lazily create) the in-memory config for a guild."""
         guild_id_str = str(guild_id)
         if guild_id_str not in self.config["guilds"]:
-            # Create default guild config
-            self.config["guilds"][guild_id_str] = {
-                "feeds": {},
-                "role_pings": {},
-                "global_settings": {
-                    "timezone": "US/Central",
-                    "default_embed_color": 0x3498DB
-                }
-            }
+            import copy
+            self.config["guilds"][guild_id_str] = copy.deepcopy(self.DEFAULT_GUILD_CONFIG)
             self.save_config()
         return self.config["guilds"][guild_id_str]
-    
-    def get_feed_config(self, guild_id: int, feed_id: str) -> Dict:
-        """Get configuration for a specific feed in a guild"""
-        guild_config = self.get_guild_config(guild_id)
-        return guild_config["feeds"].get(feed_id)
 
-    def save_history(self):
-        """Save status history to file with metadata"""
-        try:
-            data = {"last_pub_date": self.last_pub_date, "history": self.status_history}
-            with open(self.HISTORY_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving history: {e}")
+    def get_feed_config(self, guild_id: int, feed_id: str) -> Optional[Dict]:
+        return self.get_guild_config(guild_id)["feeds"].get(feed_id)
 
-    async def fetch_rss_feed(self) -> Optional[feedparser.FeedParserDict]:
-        """Fetch RSS feed with proper headers to bypass robots.txt restrictions"""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; FieldStatusBot/1.0; +http://your-domain.com/bot)",
-            "Accept": "application/rss+xml, application/xml, text/xml",
-            "Cache-Control": "no-cache",
-        }
-
-        try:
-            async with aiohttp.ClientSession(
-                headers=headers, timeout=aiohttp.ClientTimeout(total=30)
-            ) as session:
-                async with session.get(self.RSS_URL) as response:
-                    if response.status == 200:
-                        content = await response.text()
-                        return feedparser.parse(content)
-                    else:
-                        logger.error(f"HTTP {response.status} when fetching RSS feed")
-                        return None
-        except Exception as e:
-            logger.error(f"Error fetching RSS feed: {e}")
-            return None
 
     def parse_field_status(self, content: str) -> Tuple[str, List[str], bool]:
         """
@@ -619,16 +496,20 @@ class FieldStatusBot(commands.Bot):
         return embed
 
     async def send_status_update(
-        self, channel: discord.TextChannel, embed: discord.Embed
+        self, channel: discord.TextChannel, embed: discord.Embed, role_pings: dict = None
     ):
         """Send status update to channel with optional role ping"""
-        # Check if there are configured role pings for this channel
+        if role_pings is None:
+            # Look up from guild config
+            guild_config = self.get_guild_config(channel.guild.id)
+            role_pings = guild_config.get("role_pings", {})
+
         channel_id_str = str(channel.id)
-        role_ids = self.config["role_pings"].get(channel_id_str, [])
+        role_ids = role_pings.get(channel_id_str, [])
 
         message_content = None
         role_mentions = []
-        
+
         if role_ids:
             for role_id in role_ids:
                 try:
@@ -642,73 +523,12 @@ class FieldStatusBot(commands.Bot):
                         )
                 except Exception as e:
                     logger.error(f"Error getting role {role_id}: {e}")
-            
+
             if role_mentions:
-                # Include embed title in message for notifications
                 embed_title = embed.title if embed.title else "Field Status Update"
                 message_content = f"{embed_title}\n\n" + " ".join(role_mentions)
 
         await channel.send(content=message_content, embed=embed)
-
-    async def determine_next_check_interval(self) -> int:
-        """Determine the next check interval based on time, expected updates, and weather"""
-        now = datetime.now(self.CST)
-
-        # Check if we have a specific expected update time
-        if self.next_expected_update:
-            time_until_update = (self.next_expected_update - now).total_seconds() / 60
-
-            # Clear expired expected updates (more than 2 hours past)
-            if time_until_update < -120:
-                logger.info("Expected update is more than 2 hours past, clearing")
-                self.next_expected_update = None
-            else:
-                # Within 10 minutes either side of expected update: 1 minute interval
-                if -10 <= time_until_update <= 10:
-                    logger.info(
-                        f"Within 10 minutes of expected update ({time_until_update:.1f}min), using 1-minute checks"
-                    )
-                    return self.frequent_interval
-                
-                # 30 minutes before to 2 hours after expected update: 5 minute interval
-                elif -120 <= time_until_update <= 30:
-                    logger.info(
-                        f"Within expected update window ({time_until_update:.1f}min), using 5-minute checks"
-                    )
-                    return self.peak_interval
-
-        # Check weather conditions for rain/storms
-        try:
-            weather_check = await self.check_weather_conditions()
-            if weather_check:
-                logger.info("Rain/storms forecast, using weather-based frequent checks")
-                return self.weather_interval
-        except Exception as e:
-            logger.error(f"Error checking weather: {e}")
-
-        # Peak time checking (2:30 PM - 3:30 PM CST on weekdays) - fallback for regular 3pm updates
-        if now.weekday() < 5:  # Monday = 0, Sunday = 6
-            peak_start = now.replace(
-                hour=14, minute=30, second=0, microsecond=0
-            )  # 2:30 PM
-            peak_end = now.replace(
-                hour=15, minute=30, second=0, microsecond=0
-            )  # 3:30 PM
-
-            if peak_start <= now <= peak_end:
-                logger.info("Peak update time (fallback), using 5-minute checks")
-                return self.peak_interval
-
-        # Weekend morning checks (7:30 AM - 8:30 AM CST)
-        if now.weekday() >= 5:  # Weekend
-            weekend_start = now.replace(hour=7, minute=30, second=0, microsecond=0)
-            weekend_end = now.replace(hour=8, minute=30, second=0, microsecond=0)
-
-            if weekend_start <= now <= weekend_end:
-                logger.info("Weekend morning update time, using 5-minute checks")
-                return self.peak_interval
-
-        return self.normal_interval
 
     async def check_weather_conditions(self) -> bool:
         """Check if rain or storms are forecast for Madison, AL today"""
@@ -768,105 +588,6 @@ class FieldStatusBot(commands.Bot):
             except Exception as e:
                 logger.error(f"Error processing feeds for guild {guild_id_str}: {e}")
 
-        try:
-            # Fetch RSS feed
-            feed = await self.fetch_rss_feed()
-            if not feed or not feed.entries:
-                logger.warning("No RSS entries found")
-                return
-
-            # Get the latest entry
-            latest_entry = feed.entries[0]
-            content = latest_entry.get("summary", "") or latest_entry.get(
-                "description", ""
-            )
-            pub_date = latest_entry.get("published", "")
-
-            # Check if this is a new update based on pubDate
-            if pub_date == self.last_pub_date:
-                logger.debug(
-                    f"No new updates. Current pub date: {pub_date}, Last processed: {self.last_pub_date}"
-                )
-                return  # No new update
-
-            logger.info(
-                f"🆕 RSS update detected! New pub date: {pub_date}, Previous: {self.last_pub_date}"
-            )
-
-            # Parse status
-            status, closed_fields, contains_soccer = self.parse_field_status(content)
-            previous_status = self.current_status
-
-            # Check for expected update time
-            expected_update = self.extract_expected_update_time(content)
-            if expected_update:
-                self.next_expected_update = expected_update
-                logger.info(f"Next expected update: {expected_update}")
-
-            # Update tracking variables
-            self.current_status = status
-            self.last_pub_date = pub_date
-
-            # Add to history
-            history_entry = {
-                "timestamp": datetime.now(self.CST).isoformat(),
-                "pub_date": pub_date,
-                "status": status,
-                "closed_fields": closed_fields,
-                "contains_soccer": contains_soccer,
-                "content": content[:500],  # Truncate for storage
-                "expected_update": (
-                    expected_update.isoformat() if expected_update else None
-                ),
-            }
-
-            self.status_history.append(history_entry)
-
-            # Keep only last 100 entries
-            if len(self.status_history) > 100:
-                self.status_history = self.status_history[-100:]
-
-            self.save_history()
-
-            # Check if we should post an update
-            if self.should_post_update(
-                status, closed_fields, contains_soccer, previous_status
-            ):
-                channel = self.get_channel(self.CHANNEL_ID)
-                if channel:
-                    try:
-                        embed = self.create_status_embed(
-                            status, closed_fields, content, datetime.now(self.CST)
-                        )
-                        await self.send_status_update(channel, embed)
-                        logger.info(f"Posted update to Discord: {status}")
-                    except discord.Forbidden as e:
-                        logger.error(
-                            f"Permission denied posting to channel {channel.name} ({channel.id}): {e}"
-                        )
-                        logger.error(
-                            "Bot needs the following permissions in the target channel:"
-                        )
-                        logger.error("- View Channel")
-                        logger.error("- Send Messages")
-                        logger.error("- Embed Links")
-                        logger.error("- Read Message History")
-                        logger.error(
-                            "Check the DISCORD_PERMISSIONS_GUIDE.md file for help"
-                        )
-                    except discord.HTTPException as e:
-                        logger.error(f"HTTP error posting to Discord: {e}")
-                    except Exception as e:
-                        logger.error(f"Unexpected error posting to Discord: {e}")
-                else:
-                    logger.error(
-                        f"Channel {self.CHANNEL_ID} not found or bot cannot access it"
-                    )
-                    logger.error("Check that:")
-                    logger.error("1. Channel ID is correct in .env file")
-                    logger.error("2. Bot is in the same server as the channel")
-                    logger.error("3. Bot has 'View Channel' permission")
-
     async def determine_feed_check_interval(self, guild_id: int, feed_id: str) -> int:
         """Determine the check interval for a specific feed"""
         feed_config = self.get_feed_config(guild_id, feed_id)
@@ -922,53 +643,68 @@ class FieldStatusBot(commands.Bot):
         return intervals["normal"]
 
     async def process_rss_feed(self, guild_id: int, feed_id: str, feed_config: dict):
-        """Process a single RSS feed"""
+        """Process a single RSS feed."""
         try:
-            # Fetch RSS feed
             feed = await self.fetch_rss_feed_url(feed_config["url"])
             if not feed or not feed.entries:
                 logger.warning(f"No RSS entries found for feed {feed_id}")
                 return
 
-            # Get the latest entry
             latest_entry = feed.entries[0]
             content = latest_entry.get("summary", "") or latest_entry.get("description", "")
             pub_date = latest_entry.get("published", "")
             title = latest_entry.get("title", "RSS Update")
 
-            # Check if this is a new update based on pubDate
+            # ── Dedup check ───────────────────────────────────────────────────
             feed_key = f"{guild_id}:{feed_id}"
-            if not hasattr(self, '_feed_last_pub_dates'):
-                self._feed_last_pub_dates = {}
-                
-            last_pub_date = self._feed_last_pub_dates.get(feed_key)
+            guild_id_str = str(guild_id)
+
+            if self.db:
+                last_pub_date = await self.db.get_last_pub_date(guild_id_str, feed_id)
+            else:
+                last_pub_date = self._feed_last_pub_dates.get(feed_key)
+
             if pub_date == last_pub_date:
-                logger.debug(f"No new updates for feed {feed_id}. Current pub date: {pub_date}")
+                logger.debug(f"No new update for {feed_id} (pub_date unchanged)")
                 return
 
-            logger.info(f"🆕 RSS update detected for feed {feed_id}! New pub date: {pub_date}, Previous: {last_pub_date}")
+            logger.info(f"New RSS update for {feed_id}: {pub_date!r} (was {last_pub_date!r})")
 
-            # Parse content based on parser type
-            parsed_data = await self.parse_feed_content(feed_config, content, title, latest_entry)
-            
-            # Create embed
-            embed = await self.create_feed_embed(feed_config, parsed_data, pub_date)
-            
-            # Send update to the configured channel
-            channel = self.get_channel(feed_config["channel_id"])
-            if channel:
-                guild_config = self.get_guild_config(guild_id)
-                await self.send_feed_update(channel, embed, guild_config["role_pings"])
-                logger.info(f"Posted RSS update for feed {feed_id} to {channel.name}")
+            # ── Parse & determine previous status for change detection ────────
+            if self.db:
+                previous_status = await self.db.get_last_status(guild_id_str, feed_id)
             else:
-                logger.error(f"Channel {feed_config['channel_id']} not found for feed {feed_id}")
+                previous_status = None  # can't look back without DB
 
-            # Update last pub date
-            self._feed_last_pub_dates[feed_key] = pub_date
-            
-            # Save to history if enabled
-            if feed_config["history"]["enabled"]:
-                await self.save_feed_history(guild_id, feed_id, feed_config, parsed_data, pub_date)
+            parsed_data = await self.parse_feed_content(
+                feed_config, content, title, latest_entry, previous_status
+            )
+
+            # ── Post to Discord ───────────────────────────────────────────────
+            if parsed_data.get("should_post", True):
+                embed = await self.create_feed_embed(feed_config, parsed_data, pub_date)
+                channel = self.get_channel(feed_config["channel_id"])
+                if channel:
+                    guild_config = self.get_guild_config(guild_id)
+                    await self.send_feed_update(channel, embed, guild_config["role_pings"])
+                    logger.info(f"Posted update for {feed_id} to #{channel.name}")
+                else:
+                    logger.error(f"Channel {feed_config['channel_id']} not found for {feed_id}")
+
+            # ── Persist state ─────────────────────────────────────────────────
+            if self.db:
+                await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
+                if feed_config["history"]["enabled"]:
+                    await self.db.add_history_entry(guild_id_str, feed_id, {
+                        "pub_date": pub_date,
+                        "title": title,
+                        "content": content[:2000],
+                        "status": parsed_data.get("status"),
+                        "closed_fields": parsed_data.get("closed_fields", []),
+                        "contains_soccer": parsed_data.get("contains_soccer", False),
+                    })
+            else:
+                self._feed_last_pub_dates[feed_key] = pub_date
 
         except Exception as e:
             logger.error(f"Error processing RSS feed {feed_id}: {e}")
@@ -988,67 +724,63 @@ class FieldStatusBot(commands.Bot):
             logger.error(f"Error fetching RSS feed from {url}: {e}")
             return None
 
-    async def parse_feed_content(self, feed_config: dict, content: str, title: str, entry: dict) -> dict:
-        """Parse feed content based on parser type"""
+    async def parse_feed_content(
+        self,
+        feed_config: dict,
+        content: str,
+        title: str,
+        entry: dict,
+        previous_status: Optional[str] = None,
+    ) -> dict:
+        """Parse feed content and decide whether to post."""
         parser_type = feed_config["processing"]["content_parser"]
-        
+
         parsed_data = {
             "title": title,
             "content": content,
-            "original_entry": entry,
             "status": "default",
-            "fields": [],
-            "color": feed_config["processing"]["status_colors"]["default"]
+            "color": feed_config["processing"]["status_colors"]["default"],
+            "should_post": True,
         }
-        
+
         if parser_type == "field_status":
-            # Use the existing field status parsing
             status, closed_fields, contains_soccer = self.parse_field_status(content)
             parsed_data.update({
                 "status": status,
                 "closed_fields": closed_fields,
                 "contains_soccer": contains_soccer,
-                "color": self.STATUS_COLORS.get(status, parsed_data["color"])
+                "color": self.STATUS_COLORS.get(status, parsed_data["color"]),
+                "should_post": self.should_post_update(
+                    status, closed_fields, contains_soccer, previous_status
+                ),
             })
-            
-            # Check for expected update time
+
             expected_update = self.extract_expected_update_time(content)
             if expected_update:
-                if not hasattr(self, '_feed_expected_updates'):
-                    self._feed_expected_updates = {}
-                # We need guild_id and feed_id to create the key
                 parsed_data["expected_update"] = expected_update
-                
+
         elif parser_type == "generic":
-            # Generic RSS parsing
             parsed_data.update({
                 "status": "update",
-                "color": feed_config["processing"]["status_colors"]["default"]
+                "color": feed_config["processing"]["status_colors"]["default"],
+                "should_post": True,
             })
-            
-        # Apply any custom filters
-        for filter_rule in feed_config["processing"]["filters"]:
-            # TODO: Implement custom filters
-            pass
-            
+
         return parsed_data
 
     async def create_feed_embed(self, feed_config: dict, parsed_data: dict, pub_date: str) -> discord.Embed:
         """Create Discord embed for feed update"""
         template = feed_config["embed_template"]
         
-        # Format title and description using templates
-        title = template["title_template"].format(
-            title=parsed_data["title"],
-            status=parsed_data.get("status", ""),
-            **parsed_data
-        )
-        
-        description = template["description_template"].format(
-            content=parsed_data["content"][:1000] + ("..." if len(parsed_data["content"]) > 1000 else ""),
-            title=parsed_data["title"],
-            **parsed_data
-        )
+        # Build safe format context (only string/number values, no dicts/lists)
+        format_ctx = {
+            "title": parsed_data["title"],
+            "status": parsed_data.get("status", ""),
+            "content": parsed_data["content"][:1000] + ("..." if len(parsed_data["content"]) > 1000 else ""),
+        }
+
+        title = template["title_template"].format(**format_ctx)
+        description = template["description_template"].format(**format_ctx)
         
         embed = discord.Embed(
             title=title,
@@ -1061,7 +793,7 @@ class FieldStatusBot(commands.Bot):
         for field in template["fields"]:
             embed.add_field(
                 name=field["name"],
-                value=field["value"].format(**parsed_data),
+                value=field["value"].format(**format_ctx),
                 inline=field.get("inline", False)
             )
         
@@ -1125,50 +857,6 @@ class FieldStatusBot(commands.Bot):
 
         await channel.send(content=message_content, embed=embed)
 
-    async def save_feed_history(self, guild_id: int, feed_id: str, feed_config: dict, parsed_data: dict, pub_date: str):
-        """Save feed history to file"""
-        if not feed_config["history"]["file_path"]:
-            feed_config["history"]["file_path"] = f"feed_history_{guild_id}_{feed_id}.json"
-        
-        history_file = feed_config["history"]["file_path"]
-        
-        try:
-            # Load existing history
-            history = []
-            if os.path.exists(history_file):
-                with open(history_file, "r", encoding='utf-8') as f:
-                    data = json.load(f)
-                    history = data.get("history", [])
-            
-            # Add new entry
-            history_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "pub_date": pub_date,
-                "title": parsed_data["title"],
-                "content": parsed_data["content"],
-                "status": parsed_data.get("status"),
-                "parsed_data": parsed_data
-            }
-            
-            history.append(history_entry)
-            
-            # Limit history size
-            max_entries = feed_config["history"]["max_entries"]
-            if len(history) > max_entries:
-                history = history[-max_entries:]
-            
-            # Save to file
-            with open(history_file, "w", encoding='utf-8') as f:
-                json.dump({
-                    "feed_id": feed_id,
-                    "guild_id": guild_id,
-                    "last_updated": datetime.now().isoformat(),
-                    "history": history
-                }, f, indent=2)
-                
-        except Exception as e:
-            logger.error(f"Error saving feed history for {feed_id}: {e}")
-
     @check_rss_feeds.before_loop
     async def before_check_rss_feeds(self):
         """Wait for bot to be ready before starting the loop"""
@@ -1176,7 +864,31 @@ class FieldStatusBot(commands.Bot):
         logger.info("Starting field status monitoring")
 
     async def setup_hook(self):
-        """Set up slash commands by manually registering them to the tree"""
+        """Connect to DB (if configured), load persistent state, register commands."""
+        db_url = os.getenv("DATABASE_URL")
+        if db_url:
+            try:
+                self.db = Database(db_url)
+                await self.db.connect()
+                # Load all guild configs from DB into memory
+                stored = await self.db.load_all_guild_configs()
+                for guild_id, guild_config in stored.items():
+                    self.config["guilds"][guild_id] = guild_config
+                self._apply_config_defaults(self.config)
+                # Pre-warm the pub-date cache so the first check loop is instant
+                self._feed_last_pub_dates = await self.db.load_all_feed_states()
+                logger.info(
+                    f"Loaded {len(stored)} guild config(s) and "
+                    f"{len(self._feed_last_pub_dates)} feed state(s) from DB"
+                )
+            except Exception as e:
+                logger.error(f"Failed to connect to database: {e} — falling back to JSON")
+                self.db = None
+                self.config = self._load_config_from_json()
+        else:
+            logger.info("No DATABASE_URL set — using local JSON files")
+            self.config = self._load_config_from_json()
+
         # Create set_role_ping command
         set_role_ping = app_commands.Command(
             name="set_role_ping",
@@ -1575,70 +1287,118 @@ class FieldStatusBot(commands.Bot):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    async def field_history_callback(self, interaction: discord.Interaction, limit: int = 5):
-        """Show recent field status history"""
+    async def field_history_callback(
+        self, interaction: discord.Interaction, limit: int = 5, feed_id: str = "madison_field_status"
+    ):
+        """Show recent field status history from the database."""
         if limit < 1 or limit > 20:
             await interaction.response.send_message(
                 "❌ Limit must be between 1 and 20", ephemeral=True
             )
             return
 
-        if not self.status_history:
+        if not self.db:
             await interaction.response.send_message(
-                "No status history available", ephemeral=True
+                "❌ History requires a database connection (set `DATABASE_URL`).", ephemeral=True
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
+
+        guild_id_str = str(interaction.guild_id)
+        entries = await self.db.get_history(guild_id_str, feed_id, limit)
+
+        if not entries:
+            await interaction.followup.send("No history found for this feed.", ephemeral=True)
+            return
+
+        STATUS_EMOJI = {"open": "🟢", "partial": "🟡", "closed": "🔴"}
         embed = discord.Embed(
-            title=f"Recent Field Status History ({limit} entries)", color=0x3498DB
+            title=f"Field Status History — last {len(entries)} updates",
+            color=0x3498DB,
         )
 
-        for entry in list(reversed(self.status_history))[:limit]:
-            try:
-                timestamp = datetime.fromisoformat(
-                    entry["timestamp"].replace("Z", "+00:00")
-                )
-                status_emoji = {"open": "🟢", "partial": "🟡", "closed": "🔴"}.get(
-                    entry["status"], "⚪"
-                )
+        for entry in entries:
+            status = entry.get("status", "unknown")
+            emoji = STATUS_EMOJI.get(status, "⚪")
+            closed = entry.get("closed_fields") or []
+            soccer = " ⚽" if entry.get("contains_soccer") else ""
+            ts = entry.get("detected_at", "")[:19].replace("T", " ")
 
-                field_info = ""
-                if entry["closed_fields"]:
-                    field_info = f"\nClosed: {', '.join(entry['closed_fields'])}"
+            field_info = f"\nClosed: {', '.join(closed)}" if closed else ""
+            embed.add_field(
+                name=f"{emoji} {status.title()}{soccer}",
+                value=f"{ts} UTC{field_info}",
+                inline=False,
+            )
 
-                soccer_info = " ⚽" if entry.get("contains_soccer") else ""
-
-                embed.add_field(
-                    name=f"{status_emoji} {entry['status'].title()}{soccer_info}",
-                    value=f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')}{field_info}",
-                    inline=False,
-                )
-            except Exception as e:
-                embed.add_field(
-                    name="⚠️ Parse Error",
-                    value=f"Could not parse entry: {e}",
-                    inline=False,
-                )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def on_ready(self):
         """Called when bot is ready"""
         logger.info(f"Bot logged in as {self.user.name} ({self.user.id})")
-        logger.info(f"Monitoring channel ID: {self.CHANNEL_ID}")
+
+        # Auto-configure the Madison field status feed from env vars for all guilds
+        rss_url = os.getenv("RSS_FEED_URL", "https://www.madisonal.gov/RSSFeed.aspx?ModID=1&CID=Field-Status-6")
+        channel_id = self.CHANNEL_ID
+
+        if channel_id:
+            for guild in self.guilds:
+                guild_config = self.get_guild_config(guild.id)
+                if "madison_field_status" not in guild_config["feeds"]:
+                    logger.info(f"Auto-configuring Madison field status feed for guild {guild.name}")
+                    guild_config["feeds"]["madison_field_status"] = {
+                        "name": "Madison Field Status",
+                        "url": rss_url,
+                        "channel_id": channel_id,
+                        "enabled": True,
+                        "check_intervals": {
+                            "normal": 20,
+                            "peak": 5,
+                            "frequent": 1,
+                            "weather": 5
+                        },
+                        "schedule": {
+                            "peak_times": [
+                                {"start": "14:30", "end": "15:30", "days": [0, 1, 2, 3, 4]},
+                                {"start": "07:30", "end": "08:30", "days": [5, 6]}
+                            ],
+                            "weather_check": False,
+                            "weather_location": ""
+                        },
+                        "processing": {
+                            "content_parser": "field_status",
+                            "custom_parser_function": None,
+                            "filters": [],
+                            "status_colors": {
+                                "default": 0x3498DB,
+                                "success": 0x00FF00,
+                                "warning": 0xFF8C00,
+                                "error": 0xFF0000
+                            }
+                        },
+                        "embed_template": {
+                            "title_template": "{title}",
+                            "description_template": "{content}",
+                            "footer_text": "Madison Parks & Recreation",
+                            "thumbnail_url": None,
+                            "fields": []
+                        },
+                        "history": {
+                            "enabled": True,
+                            "max_entries": 100,
+                            "file_path": None
+                        }
+                    }
+                    self.save_config()
 
         # Sync slash commands
         try:
             logger.info("Syncing slash commands...")
-
-            # Sync globally (takes up to 1 hour to propagate)
             synced = await self.tree.sync()
             logger.info(f"Successfully synced {len(synced)} slash commands globally")
-
-            # Log the synced commands
             for command in synced:
                 logger.info(f"Synced command: /{command.name}")
-
         except discord.HTTPException as e:
             logger.error(f"HTTP error syncing slash commands: {e}")
             if e.status == 429:
@@ -1650,12 +1410,6 @@ class FieldStatusBot(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to sync slash commands: {e}")
             logger.error("Commands may not be available until next bot restart")
-
-        # Initialize last pub date from history if not set
-        if self.last_pub_date is None and self.status_history:
-            last_entry = self.status_history[-1]
-            self.last_pub_date = last_entry.get("pub_date")
-            logger.info(f"Initialized last pub date from history: {self.last_pub_date}")
 
         if not self.check_rss_feeds.is_running():
             self.check_rss_feeds.start()

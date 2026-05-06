@@ -35,15 +35,19 @@ ENV/
 env.bak/
 venv.bak/
 
-# Bot runtime files
+# Bot runtime files (ephemeral — regenerated on startup)
 field_status_history.json
 bot_config.json
+feed_history_*.json
 field_status_bot.log
 *.log
 
 # Development scripts (optional - customize as needed)
 # sync_dev_commands.py
 # clear_commands.py
+
+# Claude Code internal files
+.claude/
 
 # IDE
 .vscode/
