@@ -364,40 +364,6 @@ class FieldStatusBot(commands.Bot):
         # Default to open if no closure indicators
         return "open", [], contains_soccer
 
-    def extract_expected_update_time(self, content: str) -> Optional[datetime]:
-        """Extract expected update time from content like 'Further updates at 4pm'"""
-        patterns = [
-            r"(?:further )?updates? (?:at |by |around )?(\d{1,2})(?::(\d{2}))?\s*([ap]m)",
-            r"next update (?:at |by |around )?(\d{1,2})(?::(\d{2}))?\s*([ap]m)",
-            r"check back (?:at |by |around )?(\d{1,2})(?::(\d{2}))?\s*([ap]m)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, content.lower())
-            if match:
-                hour = int(match.group(1))
-                minute = int(match.group(2) or 0)
-                ampm = match.group(3)
-
-                if ampm == "pm" and hour != 12:
-                    hour += 12
-                elif ampm == "am" and hour == 12:
-                    hour = 0
-
-                # Create datetime for today with extracted time
-                now = datetime.now(self.CST)
-                update_time = now.replace(
-                    hour=hour, minute=minute, second=0, microsecond=0
-                )
-
-                # If time is in the past, assume tomorrow
-                if update_time < now:
-                    update_time += timedelta(days=1)
-
-                return update_time
-
-        return None
-
     def should_post_update(
         self,
         status: str,
@@ -746,10 +712,6 @@ class FieldStatusBot(commands.Bot):
                     status, closed_fields, contains_soccer, previous_status
                 ),
             })
-
-            expected_update = self.extract_expected_update_time(content)
-            if expected_update:
-                parsed_data["expected_update"] = expected_update
 
         elif parser_type == "generic":
             parsed_data.update({

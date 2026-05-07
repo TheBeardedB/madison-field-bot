@@ -57,16 +57,42 @@ class Database:
 
     # ── Guild config ──────────────────────────────────────────────────────────
 
+    def _normalize_config(self, cfg):
+        if isinstance(cfg, dict):
+            return cfg
+
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except json.JSONDecodeError:
+                return {"__raw_config": cfg}
+            return self._normalize_config(cfg)
+
+        if isinstance(cfg, list):
+            if all(isinstance(item, (list, tuple)) and len(item) == 2 for item in cfg):
+                return dict(cfg)
+            if all(isinstance(item, dict) for item in cfg):
+                merged = {}
+                for item in cfg:
+                    merged.update(item)
+                return merged
+            return {"__raw_config": cfg}
+
+        return {"__raw_config": cfg}
+
     async def load_all_guild_configs(self) -> Dict[str, Dict]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("SELECT guild_id, config FROM guild_configs")
             result = {}
             for row in rows:
                 try:
-                    cfg = row["config"]
-                    result[row["guild_id"]] = dict(cfg) if cfg else {}
+                    cfg = self._normalize_config(row["config"])
+                    result[row["guild_id"]] = cfg
                 except Exception as e:
-                    logger.error(f"Skipping malformed config for guild {row['guild_id']}: {e}")
+                    logger.error(
+                        f"Failed to recover config for guild {row['guild_id']}: {e}"
+                    )
+                    result[row["guild_id"]] = {"__raw_config": row["config"]}
             return result
 
     async def save_guild_config(self, guild_id: str, config: Dict):
@@ -165,7 +191,7 @@ class Database:
             return result
 
     async def get_last_status(self, guild_id: str, feed_id: str) -> Optional[str]:
-        """Get the last known status for a feed from feed_state (fast path)."""
+        """Get the last known status for a feed from feed_state, falling back to history."""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -175,7 +201,21 @@ class Database:
                 guild_id,
                 feed_id,
             )
-            return row["last_status"] if row else None
+            if row and row["last_status"]:
+                return row["last_status"]
+
+            # Fallback for legacy rows that may not have last_status yet
+            row = await conn.fetchrow(
+                """
+                SELECT status FROM feed_history
+                WHERE guild_id = $1 AND feed_id = $2
+                ORDER BY detected_at DESC
+                LIMIT 1
+                """,
+                guild_id,
+                feed_id,
+            )
+            return row["status"] if row else None
 
     async def set_last_status(self, guild_id: str, feed_id: str, status: str):
         """Store the last known status for a feed."""
