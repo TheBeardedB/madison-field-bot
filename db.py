@@ -49,6 +49,13 @@ class Database:
         self.pool = await asyncpg.create_pool(self.url, min_size=1, max_size=5)
         async with self.pool.acquire() as conn:
             await conn.execute(SCHEMA)
+            # Ensure schema migrations are applied for existing databases
+            await conn.execute(
+                """
+                ALTER TABLE feed_state
+                ADD COLUMN IF NOT EXISTS last_status TEXT
+                """
+            )
         logger.info("Database connected and schema initialized")
 
     async def close(self):
