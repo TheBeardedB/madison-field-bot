@@ -550,11 +550,38 @@ class FieldStatusBot(commands.Bot):
             logger.error(f"Error checking weather conditions: {e}")
             return False
 
+    async def perform_immediate_feed_check(self):
+        """Perform an immediate check of all feeds on startup"""
+        logger.info("Performing immediate feed check on startup...")
+        try:
+            # Check all feeds regardless of their normal interval
+            for guild_id_str, guild_config in self.config["guilds"].items():
+                try:
+                    guild_id = int(guild_id_str)
+                    guild = self.get_guild(guild_id)
+                    
+                    if not guild:
+                        logger.debug(f"Guild {guild_id} not found during startup check")
+                        continue
+                    
+                    for feed_id, feed_config in guild_config["feeds"].items():
+                        if not feed_config["enabled"]:
+                            continue
+                        
+                        try:
+                            logger.info(f"[Startup] Checking RSS feed '{feed_config['name']}' in guild {guild.name}")
+                            await self.process_rss_feed(guild_id, feed_id, feed_config)
+                        except Exception as e:
+                            logger.error(f"[Startup] Error checking feed {feed_id}: {e}")
+                            
+                except Exception as e:
+                    logger.error(f"[Startup] Error processing feeds for guild {guild_id_str}: {e}")
+        except Exception as e:
+            logger.error(f"[Startup] Error during immediate feed check: {e}", exc_info=True)
+
     @tasks.loop(minutes=1)  # Check every minute to dynamically adjust interval
     async def check_rss_feeds(self):
         """Main RSS checking task - checks all feeds across all guilds"""
-        if not hasattr(self, "_feed_last_checks"):
-            self._feed_last_checks = {}
 
         current_time = datetime.now(self.CST)
         
@@ -591,58 +618,8 @@ class FieldStatusBot(commands.Bot):
                 logger.error(f"Error processing feeds for guild {guild_id_str}: {e}")
 
     async def determine_feed_check_interval(self, guild_id: int, feed_id: str) -> int:
-        """Determine the check interval for a specific feed"""
-        feed_config = self.get_feed_config(guild_id, feed_id)
-        if not feed_config:
-            return 20  # Default interval
-            
-        intervals = feed_config["check_intervals"]
-        schedule = feed_config["schedule"]
-        
-        # Get timezone for this guild
-        guild_config = self.get_guild_config(guild_id)
-        timezone_str = guild_config["global_settings"]["timezone"]
-        tz = pytz.timezone(timezone_str)
-        now = datetime.now(tz)
-        
-        # Check if we have a specific expected update time (stored per feed)
-        feed_key = f"{guild_id}:{feed_id}"
-        if hasattr(self, '_feed_expected_updates') and feed_key in self._feed_expected_updates:
-            next_expected = self._feed_expected_updates[feed_key]
-            time_until_update = (next_expected - now).total_seconds() / 60
-            
-            # Clear expired expected updates (more than 2 hours past)
-            if time_until_update < -120:
-                logger.info(f"Expected update for {feed_id} is more than 2 hours past, clearing")
-                del self._feed_expected_updates[feed_key]
-            else:
-                # Within 10 minutes either side of expected update: frequent interval
-                if -10 <= time_until_update <= 10:
-                    return intervals["frequent"]
-                # 30 minutes before to 2 hours after expected update: peak interval  
-                elif -120 <= time_until_update <= 30:
-                    return intervals["peak"]
-        
-        # Check weather conditions if enabled
-        if schedule["weather_check"]:
-            try:
-                weather_check = await self.check_weather_conditions()
-                if weather_check:
-                    return intervals["weather"]
-            except Exception as e:
-                logger.error(f"Error checking weather for feed {feed_id}: {e}")
-        
-        # Check peak times defined in schedule
-        for peak_time in schedule["peak_times"]:
-            if now.weekday() in peak_time["days"]:
-                start_time = datetime.strptime(peak_time["start"], "%H:%M").time()
-                end_time = datetime.strptime(peak_time["end"], "%H:%M").time()
-                current_time = now.time()
-                
-                if start_time <= current_time <= end_time:
-                    return intervals["peak"]
-        
-        return intervals["normal"]
+        """Determine the check interval for a specific feed - currently fixed at 2.5 minutes"""
+        return 2.5  # Fixed interval in minutes
 
     async def process_rss_feed(self, guild_id: int, feed_id: str, feed_config: dict):
         """Process a single RSS feed."""
@@ -704,6 +681,11 @@ class FieldStatusBot(commands.Bot):
                     logger.error(f"[{feed_id}] Channel {feed_config['channel_id']} not found")
             else:
                 logger.info(f"[{feed_id}] Update seen but should_post=False (status unchanged)")
+
+            # ── Store metadata ─────────────────────────────────────────────────
+            if self.db:
+                # Store the last status for future comparison
+                await self.db.set_last_status(guild_id_str, feed_id, parsed_data.get("status"))
 
             # ── History ───────────────────────────────────────────────────────
             if self.db and feed_config["history"]["enabled"]:
@@ -875,6 +857,9 @@ class FieldStatusBot(commands.Bot):
 
     async def setup_hook(self):
         """Connect to DB (if configured), load persistent state, register commands."""
+        # Initialize feed state tracking dictionary
+        self._feed_last_checks = {}
+        
         db_url = os.getenv("DATABASE_URL")
         if db_url:
             # Step 1: connect (if this fails, fall back to JSON entirely)
@@ -894,9 +879,11 @@ class FieldStatusBot(commands.Bot):
                         self.config["guilds"][guild_id] = guild_config
                     self._apply_config_defaults(self.config)
                     feed_states = await self.db.load_all_feed_states()
+                    # Populate _feed_last_pub_dates from DB
+                    self._feed_last_pub_dates.update(feed_states)
                     logger.info(
                         f"DB startup: {len(stored)} guild config(s), "
-                        f"{len(feed_states)} feed state(s): {feed_states}"
+                        f"{len(feed_states)} feed state(s)"
                     )
                 except Exception as e:
                     logger.error(f"Failed to load state from DB: {e} — starting fresh (DB still active)", exc_info=True)
@@ -1374,6 +1361,9 @@ class FieldStatusBot(commands.Bot):
 
         if not self.check_rss_feeds.is_running():
             self.check_rss_feeds.start()
+            logger.info("Started RSS feed checking loop")
+            # Do an immediate feed check on startup
+            await self.perform_immediate_feed_check()
 
     async def on_command_error(self, ctx, error):
         """Handle legacy command errors (if any remain)"""

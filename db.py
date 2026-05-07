@@ -14,10 +14,11 @@ CREATE TABLE IF NOT EXISTS guild_configs (
 );
 
 CREATE TABLE IF NOT EXISTS feed_state (
-    guild_id     TEXT NOT NULL,
-    feed_id      TEXT NOT NULL,
-    last_pub_date TEXT,
-    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    guild_id          TEXT NOT NULL,
+    feed_id           TEXT NOT NULL,
+    last_pub_date     TEXT,
+    last_status       TEXT,
+    updated_at        TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (guild_id, feed_id)
 );
 
@@ -164,15 +165,31 @@ class Database:
             return result
 
     async def get_last_status(self, guild_id: str, feed_id: str) -> Optional[str]:
+        """Get the last known status for a feed from feed_state (fast path)."""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT status FROM feed_history
+                SELECT last_status FROM feed_state
                 WHERE guild_id = $1 AND feed_id = $2
-                ORDER BY detected_at DESC
-                LIMIT 1
                 """,
                 guild_id,
                 feed_id,
             )
-            return row["status"] if row else None
+            return row["last_status"] if row else None
+
+    async def set_last_status(self, guild_id: str, feed_id: str, status: str):
+        """Store the last known status for a feed."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO feed_state (guild_id, feed_id, last_status, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (guild_id, feed_id) DO UPDATE
+                    SET last_status = $3, updated_at = NOW()
+                """,
+                guild_id,
+                feed_id,
+                status,
+            )
+
+
