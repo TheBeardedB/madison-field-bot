@@ -6,7 +6,9 @@ import json
 import asyncio
 import random
 import copy
+import hashlib
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
 
 import discord
@@ -674,6 +676,10 @@ class FieldStatusBot(commands.Bot):
             content = latest_entry.get("summary", "") or latest_entry.get("description", "")
             pub_date = latest_entry.get("published", "")
             title = latest_entry.get("title", "RSS Update")
+            link = latest_entry.get("link", "")
+            guid = latest_entry.get("id", "") or latest_entry.get("guid", "")
+            entry_key_source = f"{guid}|{link}|{pub_date}|{title}"
+            entry_key = hashlib.sha256(entry_key_source.encode("utf-8")).hexdigest()
 
             guild_id_str = str(guild_id)
             # ── Dedup: always read from DB so restarts don't re-post ──────────
@@ -701,13 +707,40 @@ class FieldStatusBot(commands.Bot):
                 feed_config, content, title, latest_entry, previous_status
             )
 
+            if self.db and feed_config["history"]["enabled"]:
+                inserted = await self.db.add_history_entry(
+                    guild_id_str,
+                    feed_id,
+                    {
+                        "pub_date": pub_date,
+                        "title": title,
+                        "content": content[:2000],
+                        "entry_key": entry_key,
+                        "status": parsed_data.get("status"),
+                        "closed_fields": parsed_data.get("closed_fields", []),
+                        "contains_soccer": parsed_data.get("contains_soccer", False),
+                    },
+                )
+                if not inserted:
+                    logger.info(f"[{feed_id}] Duplicate history entry detected — skipping repost")
+                    await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
+                    return
+
             # ── Post ──────────────────────────────────────────────────────────
             if parsed_data.get("should_post", True):
-                embed = await self.create_feed_embed(feed_config, parsed_data, pub_date, guild_id)
                 channel = self.get_channel(feed_config["channel_id"])
                 if channel:
                     guild_config = self.get_guild_config(guild_id)
-                    await self.send_feed_update(channel, embed, guild_config["role_pings"])
+                    await self.post_or_edit_feed_update(
+                        guild_id,
+                        guild_id_str,
+                        feed_id,
+                        feed_config,
+                        parsed_data,
+                        pub_date,
+                        channel,
+                        guild_config["role_pings"],
+                    )
                     if self.db:
                         await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
                     else:
@@ -722,17 +755,6 @@ class FieldStatusBot(commands.Bot):
             if self.db:
                 # Store the last status for future comparison
                 await self.db.set_last_status(guild_id_str, feed_id, parsed_data.get("status"))
-
-            # ── History ───────────────────────────────────────────────────────
-            if self.db and feed_config["history"]["enabled"]:
-                await self.db.add_history_entry(guild_id_str, feed_id, {
-                    "pub_date": pub_date,
-                    "title": title,
-                    "content": content[:2000],
-                    "status": parsed_data.get("status"),
-                    "closed_fields": parsed_data.get("closed_fields", []),
-                    "contains_soccer": parsed_data.get("contains_soccer", False),
-                })
 
         except Exception as e:
             logger.error(f"Error processing RSS feed {feed_id}: {e}", exc_info=True)
@@ -795,6 +817,80 @@ class FieldStatusBot(commands.Bot):
             })
 
         return parsed_data
+
+    def get_central_day_key(self, pub_date: str) -> str:
+        """Convert RSS pub_date to YYYY-MM-DD in US/Central."""
+        if not pub_date:
+            return datetime.now(self.CST).strftime("%Y-%m-%d")
+        try:
+            dt = parsedate_to_datetime(pub_date)
+            if dt.tzinfo is None:
+                dt = self.CST.localize(dt)
+            return dt.astimezone(self.CST).strftime("%Y-%m-%d")
+        except Exception:
+            return datetime.now(self.CST).strftime("%Y-%m-%d")
+
+    async def build_daily_field_summary(self, guild_id_str: str, feed_id: str, day_key: str) -> str:
+        """Build a compact same-day summary from feed history."""
+        if not self.db:
+            return ""
+        entries = await self.db.get_history(guild_id_str, feed_id, 100)
+        day_entries = []
+        for entry in reversed(entries):
+            entry_day = self.get_central_day_key(entry.get("pub_date", ""))
+            if entry_day == day_key:
+                status = (entry.get("status") or "unknown").upper()
+                title = entry.get("title") or "(no title)"
+                day_entries.append(f"• {status}: {title}")
+        if not day_entries:
+            return ""
+        return "\n".join(day_entries[-10:])
+
+    async def post_or_edit_feed_update(
+        self,
+        guild_id: int,
+        guild_id_str: str,
+        feed_id: str,
+        feed_config: dict,
+        parsed_data: dict,
+        pub_date: str,
+        channel: discord.TextChannel,
+        role_pings: dict,
+    ):
+        """Edit same-day same-status post; otherwise send a new post."""
+        day_key = self.get_central_day_key(pub_date)
+        status = parsed_data.get("status", "default")
+        summary = await self.build_daily_field_summary(guild_id_str, feed_id, day_key)
+        if summary:
+            parsed_data = dict(parsed_data)
+            parsed_data["content"] = f"{parsed_data.get('content', '')}\n\nToday's Updates\n{summary}"
+
+        embed = await self.create_feed_embed(feed_config, parsed_data, pub_date, guild_id)
+        posted_new = True
+
+        if self.db:
+            post_state = await self.db.get_post_state(guild_id_str, feed_id)
+            same_day = post_state.get("last_post_date") == day_key
+            same_status = post_state.get("last_status") == status
+            message_id = post_state.get("last_message_id")
+            if same_day and same_status and message_id:
+                try:
+                    msg = await channel.fetch_message(int(message_id))
+                    await msg.edit(embed=embed)
+                    posted_new = False
+                except Exception as e:
+                    logger.warning(f"[{feed_id}] Could not edit prior message {message_id}: {e}")
+
+        if posted_new:
+            sent = await self.send_feed_update(channel, embed, role_pings)
+            if self.db:
+                await self.db.set_post_state(
+                    guild_id_str,
+                    feed_id,
+                    day_key,
+                    str(sent.id),
+                    status,
+                )
 
     def get_default_embed_color(self, guild_id: Optional[int]) -> int:
         """Get guild default embed color (Discord blurple fallback)."""
@@ -903,7 +999,7 @@ class FieldStatusBot(commands.Bot):
                 embed_title = embed.title if embed.title else "RSS Feed Update"
                 message_content = f"{embed_title}\n\n" + " ".join(role_mentions)
 
-        await channel.send(content=message_content, embed=embed)
+        return await channel.send(content=message_content, embed=embed)
 
     @check_rss_feeds.before_loop
     async def before_check_rss_feeds(self):

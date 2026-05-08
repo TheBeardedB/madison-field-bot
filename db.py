@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS feed_state (
     feed_id           TEXT NOT NULL,
     last_pub_date     TEXT,
     last_status       TEXT,
+    last_post_date    TEXT,
+    last_message_id   TEXT,
     updated_at        TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (guild_id, feed_id)
 );
@@ -30,6 +32,7 @@ CREATE TABLE IF NOT EXISTS feed_history (
     title           TEXT,
     content         TEXT,
     status          TEXT,
+    entry_key       TEXT,
     closed_fields   JSONB    DEFAULT '[]',
     contains_soccer BOOLEAN  DEFAULT FALSE,
     detected_at     TIMESTAMPTZ DEFAULT NOW()
@@ -37,6 +40,9 @@ CREATE TABLE IF NOT EXISTS feed_history (
 
 CREATE INDEX IF NOT EXISTS idx_feed_history_lookup
     ON feed_history (guild_id, feed_id, detected_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_feed_history_entry
+    ON feed_history (guild_id, feed_id, entry_key)
+    WHERE entry_key IS NOT NULL;
 """
 
 
@@ -54,6 +60,51 @@ class Database:
                 """
                 ALTER TABLE feed_state
                 ADD COLUMN IF NOT EXISTS last_status TEXT
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE feed_state
+                ADD COLUMN IF NOT EXISTS last_post_date TEXT
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE feed_state
+                ADD COLUMN IF NOT EXISTS last_message_id TEXT
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE feed_history
+                ADD COLUMN IF NOT EXISTS entry_key TEXT
+                """
+            )
+            # Deduplicate existing rows before creating/upholding unique index semantics.
+            await conn.execute(
+                """
+                DELETE FROM feed_history fh
+                USING (
+                    SELECT id
+                    FROM (
+                        SELECT id,
+                               row_number() OVER (
+                                   PARTITION BY guild_id, feed_id, entry_key
+                                   ORDER BY id
+                               ) AS rn
+                        FROM feed_history
+                        WHERE entry_key IS NOT NULL
+                    ) t
+                    WHERE t.rn > 1
+                ) d
+                WHERE fh.id = d.id
+                """
+            )
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_feed_history_entry
+                    ON feed_history (guild_id, feed_id, entry_key)
+                    WHERE entry_key IS NOT NULL
                 """
             )
         logger.info("Database connected and schema initialized")
@@ -153,24 +204,27 @@ class Database:
 
     # ── Feed history ──────────────────────────────────────────────────────────
 
-    async def add_history_entry(self, guild_id: str, feed_id: str, entry: Dict):
+    async def add_history_entry(self, guild_id: str, feed_id: str, entry: Dict) -> bool:
         async with self.pool.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 """
                 INSERT INTO feed_history
-                    (guild_id, feed_id, pub_date, title, content,
+                    (guild_id, feed_id, pub_date, title, content, entry_key,
                      status, closed_fields, contains_soccer)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+                ON CONFLICT (guild_id, feed_id, entry_key) DO NOTHING
                 """,
                 guild_id,
                 feed_id,
                 entry.get("pub_date"),
                 entry.get("title", ""),
                 entry.get("content", ""),
+                entry.get("entry_key"),
                 entry.get("status"),
                 json.dumps(entry.get("closed_fields", [])),
                 entry.get("contains_soccer", False),
             )
+            return result == "INSERT 0 1"
 
     async def get_history(
         self, guild_id: str, feed_id: str, limit: int = 10
@@ -236,6 +290,54 @@ class Database:
                 """,
                 guild_id,
                 feed_id,
+                status,
+            )
+
+    async def get_post_state(self, guild_id: str, feed_id: str) -> Dict[str, Optional[str]]:
+        """Get daily posting state for a feed."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT last_post_date, last_message_id, last_status
+                FROM feed_state
+                WHERE guild_id = $1 AND feed_id = $2
+                """,
+                guild_id,
+                feed_id,
+            )
+            if not row:
+                return {"last_post_date": None, "last_message_id": None, "last_status": None}
+            return {
+                "last_post_date": row["last_post_date"],
+                "last_message_id": row["last_message_id"],
+                "last_status": row["last_status"],
+            }
+
+    async def set_post_state(
+        self,
+        guild_id: str,
+        feed_id: str,
+        post_date: str,
+        message_id: str,
+        status: str,
+    ):
+        """Persist message tracking for daily post/edit behavior."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO feed_state
+                    (guild_id, feed_id, last_post_date, last_message_id, last_status, updated_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (guild_id, feed_id) DO UPDATE
+                    SET last_post_date = $3,
+                        last_message_id = $4,
+                        last_status = $5,
+                        updated_at = NOW()
+                """,
+                guild_id,
+                feed_id,
+                post_date,
+                message_id,
                 status,
             )
 
