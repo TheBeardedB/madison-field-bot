@@ -95,6 +95,8 @@ class FieldStatusBot(commands.Bot):
         self.config: Dict = {"guilds": {}}
         # {'{guild_id}:{feed_id}': last_pub_date} — in-memory cache, backed by DB
         self._feed_last_pub_dates: Dict[str, str] = {}
+        # Guards against concurrent duplicate processing for the same feed
+        self._feed_processing: set[str] = set()
         # Database handle; None when running without DATABASE_URL
         self.db: Optional[Database] = None
 
@@ -569,6 +571,8 @@ class FieldStatusBot(commands.Bot):
                             continue
                         
                         try:
+                            # Prevent immediate scheduled loop from re-checking right away.
+                            self._feed_last_checks[f"{guild_id}:{feed_id}"] = datetime.now(self.CST)
                             logger.info(f"[Startup] Checking RSS feed '{feed_config['name']}' in guild {guild.name}")
                             await self.process_rss_feed(guild_id, feed_id, feed_config)
                         except Exception as e:
@@ -654,6 +658,12 @@ class FieldStatusBot(commands.Bot):
 
     async def process_rss_feed(self, guild_id: int, feed_id: str, feed_config: dict):
         """Process a single RSS feed."""
+        feed_key = f"{guild_id}:{feed_id}"
+        if feed_key in self._feed_processing:
+            logger.info(f"[{feed_id}] Check already in progress — skipping duplicate invocation")
+            return
+
+        self._feed_processing.add(feed_key)
         try:
             feed = await self.fetch_rss_feed_url(feed_config["url"])
             if not feed or not feed.entries:
@@ -666,8 +676,6 @@ class FieldStatusBot(commands.Bot):
             title = latest_entry.get("title", "RSS Update")
 
             guild_id_str = str(guild_id)
-            feed_key = f"{guild_id}:{feed_id}"
-
             # ── Dedup: always read from DB so restarts don't re-post ──────────
             if self.db:
                 last_pub_date = await self.db.get_last_pub_date(guild_id_str, feed_id)
@@ -728,6 +736,8 @@ class FieldStatusBot(commands.Bot):
 
         except Exception as e:
             logger.error(f"Error processing RSS feed {feed_id}: {e}", exc_info=True)
+        finally:
+            self._feed_processing.discard(feed_key)
 
     async def fetch_rss_feed_url(self, url: str):
         """Fetch RSS feed from a specific URL"""
@@ -1434,8 +1444,6 @@ class FieldStatusBot(commands.Bot):
         if not self.check_rss_feeds.is_running():
             self.check_rss_feeds.start()
             logger.info("Started RSS feed checking loop")
-            # Do an immediate feed check on startup
-            await self.perform_immediate_feed_check()
 
     async def on_command_error(self, ctx, error):
         """Handle legacy command errors (if any remain)"""
