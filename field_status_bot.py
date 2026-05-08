@@ -5,6 +5,7 @@ import re
 import json
 import asyncio
 import random
+import copy
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -108,7 +109,7 @@ class FieldStatusBot(commands.Bot):
     DEFAULT_GUILD_CONFIG = {
         "feeds": {},
         "role_pings": {},
-        "global_settings": {"timezone": "US/Central", "default_embed_color": 0x3498DB},
+        "global_settings": {"timezone": "US/Central", "default_embed_color": 0x5865F2},
     }
 
     DEFAULT_FEED_CONFIG = {
@@ -127,8 +128,6 @@ class FieldStatusBot(commands.Bot):
         },
         "processing": {
             "content_parser": "generic",
-            "custom_parser_function": None,
-            "filters": [],
             "status_colors": {
                 "default": 0x3498DB,
                 "success": 0x00FF00,
@@ -143,7 +142,7 @@ class FieldStatusBot(commands.Bot):
             "thumbnail_url": None,
             "fields": [],
         },
-        "history": {"enabled": True, "max_entries": 100},
+        "history": {"enabled": True},
     }
 
     def _apply_config_defaults(self, config: Dict) -> Dict:
@@ -151,11 +150,28 @@ class FieldStatusBot(commands.Bot):
         for guild_id, guild_config in config.get("guilds", {}).items():
             for k, v in self.DEFAULT_GUILD_CONFIG.items():
                 if k not in guild_config:
-                    guild_config[k] = v
+                    guild_config[k] = copy.deepcopy(v)
+            # Remove stale guild-level keys.
+            for stale_key in list(guild_config.keys()):
+                if stale_key not in self.DEFAULT_GUILD_CONFIG:
+                    del guild_config[stale_key]
             for feed_id, feed_config in guild_config.get("feeds", {}).items():
                 for k, v in self.DEFAULT_FEED_CONFIG.items():
                     if k not in feed_config:
-                        feed_config[k] = v
+                        feed_config[k] = copy.deepcopy(v)
+                # Remove stale top-level feed keys.
+                for stale_key in list(feed_config.keys()):
+                    if stale_key not in self.DEFAULT_FEED_CONFIG:
+                        del feed_config[stale_key]
+                # Remove stale processing/history keys.
+                allowed_processing = set(self.DEFAULT_FEED_CONFIG["processing"].keys())
+                for stale_key in list(feed_config["processing"].keys()):
+                    if stale_key not in allowed_processing:
+                        del feed_config["processing"][stale_key]
+                allowed_history = set(self.DEFAULT_FEED_CONFIG["history"].keys())
+                for stale_key in list(feed_config["history"].keys()):
+                    if stale_key not in allowed_history:
+                        del feed_config["history"][stale_key]
         return config
 
     def _load_config_from_json(self) -> Dict:
@@ -180,16 +196,26 @@ class FieldStatusBot(commands.Bot):
     def save_config(self):
         """Persist config — DB when available, JSON file otherwise."""
         if self.db:
+            if not hasattr(self, "_config_save_tasks"):
+                self._config_save_tasks = set()
             for guild_id, guild_config in self.config["guilds"].items():
-                asyncio.create_task(self.db.save_guild_config(guild_id, guild_config))
+                task = asyncio.create_task(self.db.save_guild_config(guild_id, guild_config))
+                self._config_save_tasks.add(task)
+                task.add_done_callback(self._config_save_tasks.discard)
+                task.add_done_callback(self._log_config_save_error)
         else:
             self._save_config_to_json()
+
+    def _log_config_save_error(self, task: asyncio.Task):
+        try:
+            task.result()
+        except Exception as e:
+            logger.error(f"Failed to save config: {e}", exc_info=True)
     
     def get_guild_config(self, guild_id: int) -> Dict:
         """Return (and lazily create) the in-memory config for a guild."""
         guild_id_str = str(guild_id)
         if guild_id_str not in self.config["guilds"]:
-            import copy
             self.config["guilds"][guild_id_str] = copy.deepcopy(self.DEFAULT_GUILD_CONFIG)
             self.save_config()
         return self.config["guilds"][guild_id_str]
@@ -198,13 +224,14 @@ class FieldStatusBot(commands.Bot):
         return self.get_guild_config(guild_id)["feeds"].get(feed_id)
 
 
-    def parse_field_status(self, content: str) -> Tuple[str, List[str], bool]:
+    def parse_field_status(self, content: str) -> Tuple[str, List[str], bool, List[str]]:
         """
         Parse field status from RSS content
-        Returns: (overall_status, closed_fields, contains_soccer)
+        Returns: (overall_status, closed_fields, contains_soccer, open_fields)
         """
         content_lower = content.lower()
         closed_fields = []
+        open_fields = []
         contains_soccer = "soccer" in content_lower
 
         # Check for "all fields are open" first
@@ -212,7 +239,7 @@ class FieldStatusBot(commands.Bot):
             phrase in content_lower
             for phrase in ["all fields are open", "all fields open"]
         ):
-            return "open", [], contains_soccer
+            return "open", [], contains_soccer, []
 
         # Check for complete closure (all fields in the city)
         complete_closure_patterns = [
@@ -223,7 +250,7 @@ class FieldStatusBot(commands.Bot):
         ]
 
         if any(phrase in content_lower for phrase in complete_closure_patterns):
-            return "closed", ["All Fields"], contains_soccer
+            return "closed", ["All Fields"], contains_soccer, []
 
         # Check for weather-related complete closures
         weather_closure_patterns = [
@@ -234,7 +261,7 @@ class FieldStatusBot(commands.Bot):
 
         if any(phrase in content_lower for phrase in weather_closure_patterns):
             if "all fields" in content_lower and "closed" in content_lower:
-                return "closed", ["All Fields"], contains_soccer
+                return "closed", ["All Fields"], contains_soccer, []
 
         # Extract specific field names that are mentioned as closed
         field_patterns = [
@@ -269,6 +296,26 @@ class FieldStatusBot(commands.Bot):
                     )
                     if field_name not in closed_fields:
                         closed_fields.append(field_name)
+
+        # Parse explicit OPEN/CLOSED lines to support partial lists from city updates.
+        # Example: "Palmer Soccer 1, Dublin Soccer 2 - OPEN"
+        open_line_pattern = r"([a-zA-Z0-9\s,&\-\/]+?)\s*-\s*open"
+        closed_line_pattern = r"([a-zA-Z0-9\s,&\-\/]+?)\s*-\s*closed"
+
+        def append_field_list(raw_text: str, target: List[str]):
+            parts = re.split(r",\s*| and ", raw_text)
+            for part in parts:
+                candidate = " ".join(part.strip().split())
+                if 3 < len(candidate) < 40:
+                    candidate = " ".join(word.capitalize() for word in candidate.split())
+                    if candidate.lower() not in {"all fields", "all field"} and candidate not in target:
+                        target.append(candidate)
+
+        for match in re.finditer(open_line_pattern, content_lower):
+            append_field_list(match.group(1), open_fields)
+
+        for match in re.finditer(closed_line_pattern, content_lower):
+            append_field_list(match.group(1), closed_fields)
 
         # More precise parsing for field closures - only look for clear patterns
         # Remove date prefixes first to avoid capturing them
@@ -359,10 +406,10 @@ class FieldStatusBot(commands.Bot):
 
         # If we found specific closed fields, it's partial
         if closed_fields:
-            return "partial", closed_fields, contains_soccer
+            return "partial", closed_fields, contains_soccer, open_fields
 
         # Default to open if no closure indicators
-        return "open", [], contains_soccer
+        return "open", [], contains_soccer, open_fields
 
     def should_post_update(
         self,
@@ -375,21 +422,8 @@ class FieldStatusBot(commands.Bot):
         Return True when a city update is worth announcing.
         pub-date dedup ensures this is only called once per new RSS entry.
         """
-        # Always announce every new closed update (city may have new details)
-        if status == "closed":
-            return True
-
-        # Announce when fields reopen after being closed or partial
-        if status == "open":
-            return previous_status in ("closed", "partial")
-
-        # For partial closures, only announce when soccer fields are affected
-        if status == "partial":
-            return contains_soccer and any(
-                "soccer" in field.lower() for field in closed_fields
-            )
-
-        return False
+        # Product requirement: post every newly detected RSS item.
+        return True
 
     def categorize_fields_by_location(self, closed_fields: List[str]) -> dict:
         """Categorize closed fields by location (Dublin, Palmer, Other)"""
@@ -583,9 +617,40 @@ class FieldStatusBot(commands.Bot):
             except Exception as e:
                 logger.error(f"Error processing feeds for guild {guild_id_str}: {e}")
 
-    async def determine_feed_check_interval(self, guild_id: int, feed_id: str) -> int:
-        """Determine the check interval for a specific feed - currently fixed at 2.5 minutes"""
-        return 2.5  # Fixed interval in minutes
+    async def determine_feed_check_interval(self, guild_id: int, feed_id: str) -> float:
+        """Determine interval using per-feed settings and schedule windows."""
+        feed_config = self.get_feed_config(guild_id, feed_id) or {}
+        check_intervals = feed_config.get("check_intervals", {})
+        schedule = feed_config.get("schedule", {})
+
+        normal = float(check_intervals.get("normal", 3))
+        peak = float(check_intervals.get("peak", normal))
+        weather = float(check_intervals.get("weather", peak))
+
+        now = datetime.now(self.CST)
+        now_minutes = now.hour * 60 + now.minute
+        weekday = now.weekday()
+
+        for window in schedule.get("peak_times", []):
+            try:
+                start_h, start_m = map(int, window.get("start", "00:00").split(":"))
+                end_h, end_m = map(int, window.get("end", "00:00").split(":"))
+                start_minutes = start_h * 60 + start_m
+                end_minutes = end_h * 60 + end_m
+                days = window.get("days", [])
+                if weekday in days and start_minutes <= now_minutes <= end_minutes:
+                    return peak
+            except Exception:
+                continue
+
+        if schedule.get("weather_check"):
+            try:
+                if await self.check_weather_conditions(feed_config):
+                    return weather
+            except Exception:
+                pass
+
+        return normal
 
     async def process_rss_feed(self, guild_id: int, feed_id: str, feed_config: dict):
         """Process a single RSS feed."""
@@ -617,13 +682,6 @@ class FieldStatusBot(commands.Bot):
                 logger.debug(f"[{feed_id}] No change — skipping")
                 return
 
-            # Persist new pub_date BEFORE posting so a crash after send
-            # doesn't cause a re-post on next restart.
-            if self.db:
-                await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
-            else:
-                self._feed_last_pub_dates[feed_key] = pub_date
-
             logger.info(f"[{feed_id}] New entry detected — processing")
 
             # ── Parse ─────────────────────────────────────────────────────────
@@ -637,11 +695,15 @@ class FieldStatusBot(commands.Bot):
 
             # ── Post ──────────────────────────────────────────────────────────
             if parsed_data.get("should_post", True):
-                embed = await self.create_feed_embed(feed_config, parsed_data, pub_date)
+                embed = await self.create_feed_embed(feed_config, parsed_data, pub_date, guild_id)
                 channel = self.get_channel(feed_config["channel_id"])
                 if channel:
                     guild_config = self.get_guild_config(guild_id)
                     await self.send_feed_update(channel, embed, guild_config["role_pings"])
+                    if self.db:
+                        await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
+                    else:
+                        self._feed_last_pub_dates[feed_key] = pub_date
                     logger.info(f"[{feed_id}] Posted to #{channel.name}")
                 else:
                     logger.error(f"[{feed_id}] Channel {feed_config['channel_id']} not found")
@@ -696,16 +758,18 @@ class FieldStatusBot(commands.Bot):
         parsed_data = {
             "title": title,
             "content": content,
+            "link": entry.get("link", ""),
             "status": "default",
             "color": feed_config["processing"]["status_colors"]["default"],
             "should_post": True,
         }
 
         if parser_type == "field_status":
-            status, closed_fields, contains_soccer = self.parse_field_status(content)
+            status, closed_fields, contains_soccer, open_fields = self.parse_field_status(content)
             parsed_data.update({
                 "status": status,
                 "closed_fields": closed_fields,
+                "open_fields": open_fields,
                 "contains_soccer": contains_soccer,
                 "color": self.STATUS_COLORS.get(status, parsed_data["color"]),
                 "should_post": self.should_post_update(
@@ -722,7 +786,16 @@ class FieldStatusBot(commands.Bot):
 
         return parsed_data
 
-    async def create_feed_embed(self, feed_config: dict, parsed_data: dict, pub_date: str) -> discord.Embed:
+    def get_default_embed_color(self, guild_id: Optional[int]) -> int:
+        """Get guild default embed color (Discord blurple fallback)."""
+        if guild_id is None:
+            return 0x5865F2
+        guild_config = self.get_guild_config(guild_id)
+        return int(guild_config.get("global_settings", {}).get("default_embed_color", 0x5865F2))
+
+    async def create_feed_embed(
+        self, feed_config: dict, parsed_data: dict, pub_date: str, guild_id: Optional[int] = None
+    ) -> discord.Embed:
         """Create Discord embed for feed update"""
         template = feed_config["embed_template"]
         
@@ -735,11 +808,22 @@ class FieldStatusBot(commands.Bot):
 
         title = template["title_template"].format(**format_ctx)
         description = template["description_template"].format(**format_ctx)
-        
+
+        status = parsed_data.get("status")
+        if feed_config["processing"]["content_parser"] == "field_status":
+            if status == "open":
+                title = "OPEN"
+            elif status == "closed":
+                title = "CLOSED"
+            elif status == "partial":
+                title = "PARTIAL"
+
+        entry_link = parsed_data.get("link")
         embed = discord.Embed(
             title=title,
+            url=entry_link if entry_link else None,
             description=description,
-            color=parsed_data["color"],
+            color=parsed_data.get("color", self.get_default_embed_color(guild_id)),
             timestamp=datetime.now()
         )
         
@@ -754,19 +838,18 @@ class FieldStatusBot(commands.Bot):
         # Add special fields for field_status parser
         if feed_config["processing"]["content_parser"] == "field_status":
             if parsed_data.get("status") == "partial" and parsed_data.get("closed_fields"):
-                field_categories = self.categorize_fields_by_location(parsed_data["closed_fields"])
-                
-                # Dublin section
-                dublin_value = "Open" if not field_categories["dublin"] else "\n".join([f"• {field}" for field in field_categories["dublin"]])
-                embed.add_field(name="Dublin", value=dublin_value, inline=True)
-                
-                # Palmer section  
-                palmer_value = "Open" if not field_categories["palmer"] else "\n".join([f"• {field}" for field in field_categories["palmer"]])
-                embed.add_field(name="Palmer", value=palmer_value, inline=True)
-                
-                # Other section
-                other_value = "Open" if not field_categories["other"] else "\n".join([f"• {field}" for field in field_categories["other"]])
-                embed.add_field(name="Other", value=other_value, inline=True)
+                open_fields = parsed_data.get("open_fields", [])
+                closed_fields = parsed_data.get("closed_fields", [])
+                embed.add_field(
+                    name="Open Fields",
+                    value="\n".join([f"• {field}" for field in open_fields]) if open_fields else "Not explicitly listed",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Closed Fields",
+                    value="\n".join([f"• {field}" for field in closed_fields]),
+                    inline=True
+                )
                 
             elif parsed_data.get("closed_fields"):
                 embed.add_field(
@@ -776,7 +859,8 @@ class FieldStatusBot(commands.Bot):
                 )
         
         # Set footer
-        embed.set_footer(text=template["footer_text"])
+        footer_text = pub_date if pub_date else template["footer_text"]
+        embed.set_footer(text=footer_text)
         
         # Set thumbnail if configured
         if template["thumbnail_url"]:
@@ -934,6 +1018,20 @@ class FieldStatusBot(commands.Bot):
             callback=self.feed_config_callback
         )
         feed_config.default_permissions = discord.Permissions(administrator=True)
+
+        set_feed_intervals = app_commands.Command(
+            name="set_feed_intervals",
+            description="Update polling intervals (normal/peak/weather) for a feed",
+            callback=self.set_feed_intervals_callback,
+        )
+        set_feed_intervals.default_permissions = discord.Permissions(administrator=True)
+
+        set_feed_peak_window = app_commands.Command(
+            name="set_feed_peak_window",
+            description="Add or clear a peak-time window for a feed",
+            callback=self.set_feed_peak_window_callback,
+        )
+        set_feed_peak_window.default_permissions = discord.Permissions(administrator=True)
         
         # Add all commands to tree
         self.tree.add_command(set_role_ping)
@@ -947,6 +1045,8 @@ class FieldStatusBot(commands.Bot):
         self.tree.add_command(remove_feed)
         self.tree.add_command(toggle_feed)
         self.tree.add_command(feed_config)
+        self.tree.add_command(set_feed_intervals)
+        self.tree.add_command(set_feed_peak_window)
         
         logger.info("Added all slash commands to command tree")
 
@@ -1015,11 +1115,16 @@ class FieldStatusBot(commands.Bot):
         status_type: str,
     ):
         """Repost a historical status update to a channel for testing"""
-        # Collect all matching entries
-        matching_entries = [
-            entry for entry in self.status_history 
-            if entry.get("status") == status_type
-        ]
+        if not self.db:
+            await interaction.response.send_message(
+                "❌ Repost requires database-backed history.",
+                ephemeral=True,
+            )
+            return
+
+        guild_id_str = str(interaction.guild_id)
+        history_entries = await self.db.get_history(guild_id_str, "madison_field_status", 50)
+        matching_entries = [entry for entry in history_entries if entry.get("status") == status_type]
 
         if not matching_entries:
             await interaction.response.send_message(
@@ -1032,13 +1137,12 @@ class FieldStatusBot(commands.Bot):
 
         # Create embed from historical data
         try:
-            timestamp = datetime.fromisoformat(
-                matching_entry["timestamp"].replace("Z", "+00:00")
-            )
+            detected_at = matching_entry.get("detected_at")
+            timestamp = datetime.fromisoformat(detected_at) if detected_at else datetime.now(self.CST)
             embed = self.create_status_embed(
                 matching_entry["status"],
-                matching_entry["closed_fields"],
-                matching_entry["content"],
+                matching_entry.get("closed_fields", []),
+                matching_entry.get("content", ""),
                 timestamp,
             )
 
@@ -1072,7 +1176,10 @@ class FieldStatusBot(commands.Bot):
             )
             return
 
-        embed = discord.Embed(title="Configured Role Pings", color=0x3498DB)
+        embed = discord.Embed(
+            title="Configured Role Pings",
+            color=self.get_default_embed_color(interaction.guild_id),
+        )
 
         for channel_id_str, role_id_list in guild_config["role_pings"].items():
             try:
@@ -1130,7 +1237,8 @@ class FieldStatusBot(commands.Bot):
         permissions = target_channel.permissions_for(bot_member)
 
         embed = discord.Embed(
-            title=f"Bot Permissions Check: {target_channel.name}", color=0x3498DB
+            title=f"Bot Permissions Check: {target_channel.name}",
+            color=self.get_default_embed_color(interaction.guild_id),
         )
 
         # Required permissions for field monitoring
@@ -1214,7 +1322,7 @@ class FieldStatusBot(commands.Bot):
         embed = discord.Embed(
             title="Madison Field Status Bot Commands",
             description="Monitor and manage field status updates",
-            color=0x3498DB,
+            color=self.get_default_embed_color(interaction.guild_id),
         )
 
         embed.add_field(
@@ -1234,7 +1342,9 @@ class FieldStatusBot(commands.Bot):
 
         embed.add_field(
             name="ℹ️ Info",
-            value="◦ `/field_help` - Show this help message",
+            value="◦ `/field_help` - Show this help message\n"
+            "◦ `/set_feed_intervals` - Set normal/peak/weather intervals\n"
+            "◦ `/set_feed_peak_window` - Add/clear peak-time windows",
             inline=False,
         )
 
@@ -1279,7 +1389,7 @@ class FieldStatusBot(commands.Bot):
         STATUS_EMOJI = {"open": "🟢", "partial": "🟡", "closed": "🔴"}
         embed = discord.Embed(
             title=f"Field Status History — last {len(entries)} updates",
-            color=0x3498DB,
+            color=self.get_default_embed_color(interaction.guild_id),
         )
 
         for entry in entries:
@@ -1410,8 +1520,6 @@ class FieldStatusBot(commands.Bot):
             },
             "processing": {
                 "content_parser": parser_type,
-                "custom_parser_function": None,
-                "filters": [],
                 "status_colors": {
                     "default": 0x3498DB,
                     "success": 0x00FF00,
@@ -1427,9 +1535,7 @@ class FieldStatusBot(commands.Bot):
                 "fields": []
             },
             "history": {
-                "enabled": True,
-                "max_entries": 100,
-                "file_path": f"feed_history_{guild_id}_{feed_id}.json"
+                "enabled": True
             }
         }
         
@@ -1463,7 +1569,7 @@ class FieldStatusBot(commands.Bot):
         
         embed = discord.Embed(
             title="📡 RSS Feeds",
-            color=0x3498DB,
+            color=self.get_default_embed_color(interaction.guild_id),
             description=f"Configured feeds for **{interaction.guild.name}**"
         )
         
@@ -1542,7 +1648,7 @@ class FieldStatusBot(commands.Bot):
         
         embed = discord.Embed(
             title=f"⚙️ Feed Configuration: {feed_config['name']}",
-            color=0x3498DB
+            color=self.get_default_embed_color(interaction.guild_id)
         )
         
         embed.add_field(name="Feed ID", value=feed_id, inline=True)
@@ -1558,11 +1664,124 @@ class FieldStatusBot(commands.Bot):
         
         embed.add_field(
             name="History", 
-            value=f"{'✅ Enabled' if feed_config['history']['enabled'] else '❌ Disabled'} (Max: {feed_config['history']['max_entries']})", 
+            value="✅ Enabled" if feed_config["history"]["enabled"] else "❌ Disabled", 
             inline=True
         )
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def set_feed_intervals_callback(
+        self,
+        interaction: discord.Interaction,
+        feed_id: str,
+        normal: float,
+        peak: float,
+        weather: float,
+    ):
+        """Set per-feed polling intervals in minutes."""
+        guild_id = interaction.guild_id
+        guild_config = self.get_guild_config(guild_id)
+
+        if feed_id not in guild_config["feeds"]:
+            await interaction.response.send_message(
+                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.",
+                ephemeral=True,
+            )
+            return
+
+        if min(normal, peak, weather) <= 0:
+            await interaction.response.send_message(
+                "❌ Intervals must be greater than 0 minutes.",
+                ephemeral=True,
+            )
+            return
+
+        feed = guild_config["feeds"][feed_id]
+        feed["check_intervals"]["normal"] = round(normal, 2)
+        feed["check_intervals"]["peak"] = round(peak, 2)
+        feed["check_intervals"]["weather"] = round(weather, 2)
+        self.save_config()
+
+        await interaction.response.send_message(
+            f"✅ Updated `{feed_id}` intervals: normal={normal}m, peak={peak}m, weather={weather}m",
+            ephemeral=True,
+        )
+
+    async def set_feed_peak_window_callback(
+        self,
+        interaction: discord.Interaction,
+        feed_id: str,
+        action: str,
+        start: str = "14:30",
+        end: str = "15:30",
+        days_csv: str = "0,1,2,3,4",
+    ):
+        """Add or clear peak windows for a feed.
+
+        days_csv uses Monday=0 .. Sunday=6.
+        """
+        guild_id = interaction.guild_id
+        guild_config = self.get_guild_config(guild_id)
+
+        if feed_id not in guild_config["feeds"]:
+            await interaction.response.send_message(
+                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.",
+                ephemeral=True,
+            )
+            return
+
+        feed = guild_config["feeds"][feed_id]
+        feed.setdefault("schedule", {})
+        feed["schedule"].setdefault("peak_times", [])
+
+        action_norm = action.strip().lower()
+        if action_norm not in {"add", "clear"}:
+            await interaction.response.send_message(
+                "❌ `action` must be `add` or `clear`.",
+                ephemeral=True,
+            )
+            return
+
+        if action_norm == "clear":
+            feed["schedule"]["peak_times"] = []
+            self.save_config()
+            await interaction.response.send_message(
+                f"✅ Cleared all peak windows for `{feed_id}`.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            start_h, start_m = map(int, start.split(":"))
+            end_h, end_m = map(int, end.split(":"))
+            if not (0 <= start_h <= 23 and 0 <= start_m <= 59 and 0 <= end_h <= 23 and 0 <= end_m <= 59):
+                raise ValueError("Invalid time range")
+        except Exception:
+            await interaction.response.send_message(
+                "❌ Time must use 24h format `HH:MM` (example: `14:30`).",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            days = [int(d.strip()) for d in days_csv.split(",") if d.strip() != ""]
+            if not days or any(d < 0 or d > 6 for d in days):
+                raise ValueError("Days out of range")
+        except Exception:
+            await interaction.response.send_message(
+                "❌ `days_csv` must be comma-separated day indexes 0-6 (Mon=0..Sun=6).",
+                ephemeral=True,
+            )
+            return
+
+        window = {"start": start, "end": end, "days": sorted(set(days))}
+        feed["schedule"]["peak_times"].append(window)
+        self.save_config()
+
+        await interaction.response.send_message(
+            f"✅ Added peak window for `{feed_id}`: {start}-{end} on days {','.join(map(str, window['days']))}.",
+            ephemeral=True,
+        )
 
 
 # Bot setup and run
