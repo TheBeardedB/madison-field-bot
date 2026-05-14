@@ -97,11 +97,13 @@ class Database:
                 WHERE fh.id = d.id
                 """
             )
+            # Rebuild the unique index in a form ON CONFLICT can infer.
+            # A plain unique index still allows multiple NULL entry_key values in Postgres.
+            await conn.execute("DROP INDEX IF EXISTS uq_feed_history_entry")
             await conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_feed_history_entry
                     ON feed_history (guild_id, feed_id, entry_key)
-                    WHERE entry_key IS NOT NULL
                 """
             )
         logger.info("Database connected and schema initialized")
