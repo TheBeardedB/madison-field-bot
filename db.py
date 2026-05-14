@@ -40,9 +40,6 @@ CREATE TABLE IF NOT EXISTS feed_history (
 
 CREATE INDEX IF NOT EXISTS idx_feed_history_lookup
     ON feed_history (guild_id, feed_id, detected_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_feed_history_entry
-    ON feed_history (guild_id, feed_id, entry_key)
-    WHERE entry_key IS NOT NULL;
 """
 
 
