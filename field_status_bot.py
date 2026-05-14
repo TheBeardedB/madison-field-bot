@@ -46,15 +46,7 @@ root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 root_logger.addHandler(console_handler)
 
-# Add a file handler when running locally (Railway provides ephemeral disk; not worth persisting)
-if not os.getenv("RAILWAY_ENVIRONMENT"):
-    try:
-        file_handler = logging.FileHandler("field_status_bot.log", encoding='utf-8')
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
-    except OSError:
-        pass
+# Console-only logging so output is visible in Railway logs.
 
 logger = logging.getLogger(__name__)
 
@@ -590,6 +582,10 @@ class FieldStatusBot(commands.Bot):
         """Main RSS checking task - checks all feeds across all guilds"""
 
         current_time = datetime.now(self.CST)
+        logger.info(
+            f"[CheckLoop] Starting feed check cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"for {len(self.config.get('guilds', {}))} guild(s)"
+        )
         
         # Iterate through all guilds and their feeds
         for guild_id_str, guild_config in self.config["guilds"].items():
@@ -603,6 +599,9 @@ class FieldStatusBot(commands.Bot):
                 
                 for feed_id, feed_config in guild_config["feeds"].items():
                     if not feed_config["enabled"]:
+                        logger.info(
+                            f"[CheckLoop][{guild.name}/{feed_id}] Feed disabled - skipping scheduled check"
+                        )
                         continue
                     
                     # Check if it's time to check this feed
@@ -612,6 +611,10 @@ class FieldStatusBot(commands.Bot):
                     # Determine interval for this specific feed
                     interval = await self.determine_feed_check_interval(guild_id, feed_id)
                     time_since_check = (current_time - last_check).total_seconds() / 60
+                    logger.info(
+                        f"[CheckLoop][{guild.name}/{feed_id}] last_check={last_check.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                        f"elapsed={time_since_check:.2f}m interval={interval:.2f}m"
+                    )
                     
                     if time_since_check >= interval:
                         logger.info(f"Checking RSS feed '{feed_config['name']}' in guild {guild.name} (interval: {interval} minutes)")
@@ -619,6 +622,10 @@ class FieldStatusBot(commands.Bot):
                         
                         # Process the feed
                         await self.process_rss_feed(guild_id, feed_id, feed_config)
+                    else:
+                        logger.info(
+                            f"[CheckLoop][{guild.name}/{feed_id}] Not due yet - next check in {max(interval - time_since_check, 0):.2f}m"
+                        )
                         
             except Exception as e:
                 logger.error(f"Error processing feeds for guild {guild_id_str}: {e}")
@@ -667,6 +674,7 @@ class FieldStatusBot(commands.Bot):
 
         self._feed_processing.add(feed_key)
         try:
+            logger.info(f"[{feed_id}] Fetching feed URL: {feed_config.get('url', '(missing url)')}")
             feed = await self.fetch_rss_feed_url(feed_config["url"])
             if not feed or not feed.entries:
                 logger.warning(f"No RSS entries found for feed {feed_id}")
@@ -678,6 +686,9 @@ class FieldStatusBot(commands.Bot):
             title = latest_entry.get("title", "RSS Update")
             link = latest_entry.get("link", "")
             guid = latest_entry.get("id", "") or latest_entry.get("guid", "")
+            logger.info(
+                f"[{feed_id}] Latest entry title={title!r} pub_date={pub_date!r} guid={guid!r} link={link!r}"
+            )
             entry_key_source = f"{guid}|{link}|{pub_date}|{title}"
             entry_key = hashlib.sha256(entry_key_source.encode("utf-8")).hexdigest()
 
@@ -693,7 +704,7 @@ class FieldStatusBot(commands.Bot):
             )
 
             if pub_date == last_pub_date:
-                logger.debug(f"[{feed_id}] No change — skipping")
+                logger.info(f"[{feed_id}] No change (pub_date unchanged) — skipping")
                 return
 
             logger.info(f"[{feed_id}] New entry detected — processing")
@@ -705,6 +716,10 @@ class FieldStatusBot(commands.Bot):
             )
             parsed_data = await self.parse_feed_content(
                 feed_config, content, title, latest_entry, previous_status
+            )
+            logger.info(
+                f"[{feed_id}] Parsed status={parsed_data.get('status')!r} should_post={parsed_data.get('should_post', True)} "
+                f"closed_count={len(parsed_data.get('closed_fields', []))}"
             )
 
             if self.db and feed_config["history"]["enabled"]:
@@ -724,6 +739,7 @@ class FieldStatusBot(commands.Bot):
                 if not inserted:
                     logger.info(f"[{feed_id}] Duplicate history entry detected — skipping repost")
                     await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
+                    logger.info(f"[{feed_id}] Updated last_pub_date despite duplicate history entry")
                     return
 
             # ── Post ──────────────────────────────────────────────────────────
@@ -760,14 +776,17 @@ class FieldStatusBot(commands.Bot):
             logger.error(f"Error processing RSS feed {feed_id}: {e}", exc_info=True)
         finally:
             self._feed_processing.discard(feed_key)
+            logger.info(f"[{feed_id}] Feed check complete")
 
     async def fetch_rss_feed_url(self, url: str):
         """Fetch RSS feed from a specific URL"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as response:
+                    logger.info(f"[FeedFetch] GET {url} -> HTTP {response.status}")
                     if response.status == 200:
                         content = await response.text()
+                        logger.info(f"[FeedFetch] Received {len(content)} bytes from {url}")
                         return feedparser.parse(content)
                     else:
                         logger.error(f"Failed to fetch RSS feed from {url}: {response.status}")
