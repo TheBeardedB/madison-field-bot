@@ -20,6 +20,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from db import Database
+from llm_field_parser import GitHubModelsFieldParser
 
 load_dotenv()
 
@@ -99,6 +100,7 @@ class FieldStatusBot(commands.Bot):
             "partial": 0xFF8C00,
             "closed": 0xFF0000,
         }
+        self.github_models_field_parser = GitHubModelsFieldParser()
 
     # ── Config helpers ────────────────────────────────────────────────────────
 
@@ -230,6 +232,34 @@ class FieldStatusBot(commands.Bot):
         open_fields = []
         contains_soccer = "soccer" in content_lower
 
+        canonical_fields = [
+            "All Fields",
+            "Palmer Park",
+            "Dublin Park",
+            "Palmer Soccer 1",
+            "Palmer Soccer 2",
+            "Palmer Soccer 2&3",
+            "Palmer Soccer 3",
+            "Palmer Soccer 4",
+            "Palmer Soccer 5",
+            "Palmer Soccer 6",
+            "Palmer Soccer 7",
+            "Palmer Soccer 7-10",
+            "Palmer Soccer 8",
+            "Palmer Soccer 9",
+            "Palmer Soccer 10",
+            "Dublin Soccer 1",
+            "Dublin Soccer 2",
+            "Dublin Fields",
+            "Wellness Center Fields",
+            "Westco 4",
+            "Westco Field 5",
+            "Westco Fields 2 & 3",
+            "Palmer Baseball",
+            "Palmer Baseball 5",
+            "Palmer Softball",
+        ]
+
         # Check for "all fields are open" first
         if any(
             phrase in content_lower
@@ -259,11 +289,20 @@ class FieldStatusBot(commands.Bot):
             if "all fields" in content_lower and "closed" in content_lower:
                 return "closed", ["All Fields"], contains_soccer, []
 
+        # Normalize date/update prefixes early so downstream patterns do not
+        # accidentally capture date fragments as field names.
+        clean_content = re.sub(r"^\d+\.\d+\.\d+\s*-\s*", "", content_lower)
+        clean_content = re.sub(r"^\d+\.\d+\.\d+\s*update:\s*", "", clean_content)
+        clean_content = re.sub(r"^\d+\.\d+\.\d+\s*updated:\s*", "", clean_content)
+
+        # Normalize specific phrasing to canonical field names.
+        if re.search(r"\bsoftball fields?\s+at\s+palmer park\b.*\bclosed\b", content_lower):
+            closed_fields.append("Palmer Softball")
+
         # Extract specific field names that are mentioned as closed
         field_patterns = [
             # Specific field patterns
             r"(palmer soccer \d+(?:&\d+)?(?:-\d+)?)",
-            r"(palmer soccer \d+)",
             r"(dublin soccer \d+)",
             r"(palmer baseball \d*)",
             r"(palmer softball)",
@@ -276,8 +315,6 @@ class FieldStatusBot(commands.Bot):
             r"all fields at (palmer park)",
             r"all fields at (dublin park)",
             r"all (dublin park) fields",
-            r"(palmer park)",
-            r"(dublin park)",
         ]
 
         for pattern in field_patterns:
@@ -302,21 +339,19 @@ class FieldStatusBot(commands.Bot):
             parts = re.split(r",\s*| and ", raw_text)
             for part in parts:
                 candidate = " ".join(part.strip().split())
+                candidate = re.sub(r"[\s\-;:,]+$", "", candidate)
                 if 3 < len(candidate) < 40:
                     candidate = " ".join(word.capitalize() for word in candidate.split())
                     if candidate.lower() not in {"all fields", "all field"} and candidate not in target:
                         target.append(candidate)
 
-        for match in re.finditer(open_line_pattern, content_lower):
+        for match in re.finditer(open_line_pattern, clean_content):
             append_field_list(match.group(1), open_fields)
 
-        for match in re.finditer(closed_line_pattern, content_lower):
+        for match in re.finditer(closed_line_pattern, clean_content):
             append_field_list(match.group(1), closed_fields)
 
         # More precise parsing for field closures - only look for clear patterns
-        # Remove date prefixes first to avoid capturing them
-        clean_content = re.sub(r"^\d+\.\d+\.\d+\s*-\s*", "", content_lower)
-        clean_content = re.sub(r"\d+\.\d+\.\d+\s*update:\s*", "", clean_content)
 
         # Look for comma-separated list before "closed"
         list_closure_pattern = r"^([^.]+?)\s+(?:all\s+)?closed\s*[.;]"
@@ -342,9 +377,10 @@ class FieldStatusBot(commands.Bot):
                         continue
 
                     # Clean up field name
-                    field_name = " ".join(word.capitalize() for word in part.split())
-                    if field_name not in closed_fields and len(field_name) < 30:
-                        closed_fields.append(field_name)
+                field_name = " ".join(word.capitalize() for word in part.split())
+                field_name = re.sub(r"[\s\-;:,]+$", "", field_name)
+                if field_name not in closed_fields and len(field_name) < 30:
+                    closed_fields.append(field_name)
 
         # Also look for "Field - CLOSED" pattern specifically
         dash_closed_pattern = r"([a-zA-Z\s\d&]+?)\s*-\s*closed"
@@ -363,6 +399,7 @@ class FieldStatusBot(commands.Bot):
                     field_name = " ".join(
                         word.capitalize() for word in field_name.split()
                     )
+                    field_name = re.sub(r"[\s\-;:,]+$", "", field_name)
                     if field_name not in closed_fields:
                         closed_fields.append(field_name)
 
@@ -402,7 +439,51 @@ class FieldStatusBot(commands.Bot):
 
         # If we found specific closed fields, it's partial
         if closed_fields:
+            # Optional GitHub Models assist for partial extraction.
+            # We only call it for messages that mention closures but are not already
+            # classified as city-wide open/closed above.
+            if "closed" in content_lower:
+                llm_result = self.github_models_field_parser.extract_closed_fields_with_llm(
+                    content, canonical_fields
+                )
+                llm_fields = llm_result.get("closed_fields", [])
+                llm_confidence = float(llm_result.get("confidence", 0.0))
+                llm_reason = llm_result.get("reason", "unknown")
+                llm_raw = llm_result.get("raw_closed_fields", [])
+
+                safe_log(
+                    "info",
+                    f"LLM partial parse attempted: reason={llm_reason}, "
+                    f"confidence={llm_confidence:.2f}, raw={llm_raw}, normalized={llm_fields}",
+                )
+
+                if llm_reason == "ok" and llm_fields:
+                    if llm_fields == ["All Fields"]:
+                        return "closed", ["All Fields"], contains_soccer, open_fields
+                    closed_fields = llm_fields
+
             return "partial", closed_fields, contains_soccer, open_fields
+
+        # If regex finds no specific fields but text still indicates closure, let LLM try.
+        if "closed" in content_lower:
+            llm_result = self.github_models_field_parser.extract_closed_fields_with_llm(
+                content, canonical_fields
+            )
+            llm_fields = llm_result.get("closed_fields", [])
+            llm_confidence = float(llm_result.get("confidence", 0.0))
+            llm_reason = llm_result.get("reason", "unknown")
+            llm_raw = llm_result.get("raw_closed_fields", [])
+
+            safe_log(
+                "info",
+                f"LLM partial parse fallback: reason={llm_reason}, "
+                f"confidence={llm_confidence:.2f}, raw={llm_raw}, normalized={llm_fields}",
+            )
+
+            if llm_reason == "ok" and llm_fields:
+                if llm_fields == ["All Fields"]:
+                    return "closed", ["All Fields"], contains_soccer, open_fields
+                return "partial", llm_fields, contains_soccer, open_fields
 
         # Default to open if no closure indicators
         return "open", [], contains_soccer, open_fields
