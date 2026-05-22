@@ -221,6 +221,47 @@ class FieldStatusBot(commands.Bot):
     def get_feed_config(self, guild_id: int, feed_id: str) -> Optional[Dict]:
         return self.get_guild_config(guild_id)["feeds"].get(feed_id)
 
+    def _log_config_snapshot(self, context: str):
+        """Emit a compact config snapshot for startup/troubleshooting."""
+        try:
+            guilds = self.config.get("guilds", {})
+            total_feeds = sum(len(g.get("feeds", {})) for g in guilds.values())
+            enabled_feeds = sum(
+                1
+                for g in guilds.values()
+                for f in g.get("feeds", {}).values()
+                if f.get("enabled", True)
+            )
+            logger.info(
+                f"[ConfigSnapshot:{context}] db_mode={'db' if self.db else 'json'} "
+                f"guild_count={len(guilds)} total_feeds={total_feeds} enabled_feeds={enabled_feeds}"
+            )
+
+            if not guilds:
+                logger.warning(
+                    f"[ConfigSnapshot:{context}] No guild configs loaded. "
+                    "Bot will check 0 guilds until a guild/feed config exists in this environment."
+                )
+                return
+
+            for guild_id, guild_cfg in guilds.items():
+                feeds = guild_cfg.get("feeds", {})
+                if not feeds:
+                    logger.info(f"[ConfigSnapshot:{context}] guild={guild_id} feeds=0")
+                    continue
+                for feed_id, feed_cfg in feeds.items():
+                    parser_type = (
+                        feed_cfg.get("processing", {}).get("content_parser", "unknown")
+                    )
+                    channel_id = feed_cfg.get("channel_id")
+                    enabled = feed_cfg.get("enabled", True)
+                    logger.info(
+                        f"[ConfigSnapshot:{context}] guild={guild_id} feed_id={feed_id} "
+                        f"enabled={enabled} parser={parser_type} channel_id={channel_id}"
+                    )
+        except Exception as e:
+            logger.error(f"[ConfigSnapshot:{context}] Failed to summarize config: {e}")
+
 
     def parse_field_status(self, content: str) -> Tuple[str, List[str], bool, List[str]]:
         """
@@ -258,6 +299,7 @@ class FieldStatusBot(commands.Bot):
             "Palmer Baseball",
             "Palmer Baseball 5",
             "Palmer Softball",
+            "Palmer Expansion Soccer Fields",
         ]
 
         # Check for "all fields are open" first
@@ -311,6 +353,7 @@ class FieldStatusBot(commands.Bot):
             r"(westco \d+)",
             r"(wellness center fields)",
             r"(dublin fields)",
+            r"(palmer expansion soccer fields)",
             # Park-wide patterns
             r"all fields at (palmer park)",
             r"all fields at (dublin park)",
@@ -370,9 +413,10 @@ class FieldStatusBot(commands.Bot):
 
                 for part in field_parts:
                     part = part.strip()
+                    part = re.sub(r"\s+(?:are|is)\s*$", "", part)
                     # Skip if too short or has common false matches
                     if len(part) < 3 or any(
-                        skip in part for skip in ["will be", "are", "for", "at", "on"]
+                        skip in part for skip in ["will be", "for", "at", "on"]
                     ):
                         continue
 
@@ -667,7 +711,11 @@ class FieldStatusBot(commands.Bot):
             f"[CheckLoop] Starting feed check cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')} "
             f"for {len(self.config.get('guilds', {}))} guild(s)"
         )
-        
+        if not self.config.get("guilds"):
+            logger.warning(
+                f"[CheckLoop] 0 guilds configured in memory. db_mode={'db' if self.db else 'json'}"
+            )
+         
         # Iterate through all guilds and their feeds
         for guild_id_str, guild_config in self.config["guilds"].items():
             try:
@@ -1114,6 +1162,7 @@ class FieldStatusBot(commands.Bot):
         
         db_url = os.getenv("DATABASE_URL")
         if db_url:
+            logger.info("[Startup] DATABASE_URL detected. Loading config/state from database.")
             # Step 1: connect (if this fails, fall back to JSON entirely)
             try:
                 self.db = Database(db_url)
@@ -1137,11 +1186,14 @@ class FieldStatusBot(commands.Bot):
                         f"DB startup: {len(stored)} guild config(s), "
                         f"{len(feed_states)} feed state(s)"
                     )
+                    self._log_config_snapshot("db_load")
                 except Exception as e:
                     logger.error(f"Failed to load state from DB: {e} — starting fresh (DB still active)", exc_info=True)
+                    self._log_config_snapshot("db_load_failed")
         else:
             logger.info("No DATABASE_URL set — using local JSON files")
             self.config = self._load_config_from_json()
+            self._log_config_snapshot("json_load")
 
         # Create set_role_ping command
         set_role_ping = app_commands.Command(
