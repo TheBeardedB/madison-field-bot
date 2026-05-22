@@ -273,6 +273,36 @@ class FieldStatusBot(commands.Bot):
         open_fields = []
         contains_soccer = "soccer" in content_lower
 
+        # Simple status classification per product rule:
+        # - only "open" -> open
+        # - both "open" and "closed" -> partial
+        # - only "closed" -> closed
+        has_open = bool(re.search(r"\bopen\b", content_lower))
+        has_closed = bool(re.search(r"\bclosed\b", content_lower))
+
+        if has_closed and not has_open:
+            # Only classify as fully closed when closure language is city-wide.
+            # Otherwise (specific fields/parks closed without any "open" text),
+            # continue into partial extraction logic below.
+            citywide_closed_patterns = [
+                r"\ball fields are closed\b",
+                r"\ball fields closed\b",
+                r"\ball fields are currently closed\b",
+                r"\ball fields currently closed\b",
+                r"\ball parks are closed\b",
+                r"\ball parks closed\b",
+            ]
+            both_parks_closed = (
+                "all fields at" in content_lower
+                and "dublin park" in content_lower
+                and "palmer park" in content_lower
+                and "closed" in content_lower
+            )
+            if any(re.search(p, content_lower) for p in citywide_closed_patterns) or both_parks_closed:
+                return "closed", ["All Fields"], contains_soccer, []
+        if has_open and not has_closed:
+            return "open", [], contains_soccer, []
+
         canonical_fields = [
             "All Fields",
             "Palmer Park",
@@ -302,34 +332,9 @@ class FieldStatusBot(commands.Bot):
             "Palmer Expansion Soccer Fields",
         ]
 
-        # Check for "all fields are open" first
-        if any(
-            phrase in content_lower
-            for phrase in ["all fields are open", "all fields open"]
-        ):
+        # If neither keyword is present, default to open.
+        if not has_open and not has_closed:
             return "open", [], contains_soccer, []
-
-        # Check for complete closure (all fields in the city)
-        complete_closure_patterns = [
-            "all fields are closed",
-            "all fields closed",
-            "all parks are closed",
-            "all parks closed",
-        ]
-
-        if any(phrase in content_lower for phrase in complete_closure_patterns):
-            return "closed", ["All Fields"], contains_soccer, []
-
-        # Check for weather-related complete closures
-        weather_closure_patterns = [
-            "due to lightning",
-            "threat of severe weather",
-            "due to weather",
-        ]
-
-        if any(phrase in content_lower for phrase in weather_closure_patterns):
-            if "all fields" in content_lower and "closed" in content_lower:
-                return "closed", ["All Fields"], contains_soccer, []
 
         # Normalize date/update prefixes early so downstream patterns do not
         # accidentally capture date fragments as field names.
