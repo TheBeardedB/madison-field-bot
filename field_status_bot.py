@@ -552,6 +552,7 @@ class FieldStatusBot(commands.Bot):
 
     async def _append_history_entry(
         self,
+        guild_id: int,
         entry: dict,
         content: str,
         pub_date: str,
@@ -566,6 +567,7 @@ class FieldStatusBot(commands.Bot):
         ]
 
         await self.db.add_history_entry(
+            guild_id,
             self.feed_id,
             {
                 "pub_date": pub_date,
@@ -735,6 +737,7 @@ class FieldStatusBot(commands.Bot):
 
             statuses = self.parse_field_statuses(content)
             embeds, image_payloads = self.build_embeds(entry, content, statuses, pub_date)
+            guild_id = channel.guild.id if channel.guild else 0
 
             message_id = await self._upsert_single_message(channel, embeds, image_payloads)
             if message_id is None:
@@ -746,7 +749,14 @@ class FieldStatusBot(commands.Bot):
             self.feed_state["last_status"] = self.summarize_statuses(statuses)
             await self._persist_feed_state()
             try:
-                await self._append_history_entry(entry, content, pub_date, statuses, entry_key)
+                await self._append_history_entry(
+                    guild_id,
+                    entry,
+                    content,
+                    pub_date,
+                    statuses,
+                    entry_key,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to append feed history entry; continuing with posted status message: %s",

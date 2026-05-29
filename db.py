@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS feed_status (
 
 CREATE TABLE IF NOT EXISTS feed_history (
     id              SERIAL PRIMARY KEY,
+    guild_id        BIGINT   NOT NULL,
     feed_id         TEXT NOT NULL,
     pub_date        TEXT,
     title           TEXT,
@@ -33,7 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_feed_history_lookup
     ON feed_history (feed_id, detected_at DESC);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_feed_history_entry
-    ON feed_history (feed_id, entry_key);
+    ON feed_history (guild_id, feed_id, entry_key);
 """
 
 
@@ -126,7 +127,7 @@ class Database:
                 last_status,
             )
 
-    async def add_history_entry(self, feed_id: str, entry: Dict) -> bool:
+    async def add_history_entry(self, guild_id: int, feed_id: str, entry: Dict) -> bool:
         async with self.pool.acquire() as conn:
             entry_key = entry.get("entry_key")
 
@@ -135,9 +136,10 @@ class Database:
                     """
                     SELECT 1
                     FROM feed_history
-                    WHERE feed_id = $1 AND entry_key = $2
+                    WHERE guild_id = $1 AND feed_id = $2 AND entry_key = $3
                     LIMIT 1
                     """,
+                    guild_id,
                     feed_id,
                     entry_key,
                 )
@@ -147,10 +149,11 @@ class Database:
             result = await conn.execute(
                 """
                 INSERT INTO feed_history
-                    (feed_id, pub_date, title, content, entry_key,
+                    (guild_id, feed_id, pub_date, title, content, entry_key,
                      status, closed_fields, contains_soccer)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
                 """,
+                guild_id,
                 feed_id,
                 entry.get("pub_date"),
                 entry.get("title", ""),
