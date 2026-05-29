@@ -61,7 +61,7 @@ IMAGE_THEME_COLORS = {
     "Dublin": "#7d5ba6",
 }
 
-IMAGE_RENDER_VERSION = "2026-05-29-3"
+IMAGE_RENDER_VERSION = "2026-05-29-4"
 
 
 class FieldStatusBot(commands.Bot):
@@ -313,36 +313,62 @@ class FieldStatusBot(commands.Bot):
     @staticmethod
     def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         candidates = []
+        repo_dir = Path(__file__).resolve().parent
         pil_font_dir = Path(ImageFont.__file__).resolve().parent
+        font_kind = "bold" if bold else "regular"
+        logger.info("Loading %s font at size %s", font_kind, size)
+        candidates.extend(
+            [
+                repo_dir / "fonts" / ("Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"),
+                repo_dir / "font" / ("Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"),
+                repo_dir / "assets" / "fonts" / ("Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"),
+                repo_dir / "assets" / "font" / ("Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"),
+            ]
+        )
         if os.name == "nt":
             candidates.extend(
                 [
-                    r"C:\Windows\Fonts\arialbd.ttf" if bold else r"C:\Windows\Fonts\arial.ttf",
-                    r"C:\Windows\Fonts\segoeuib.ttf" if bold else r"C:\Windows\Fonts\segoeui.ttf",
+                    Path(r"C:\Windows\Fonts\Roboto-Bold.ttf" if bold else r"C:\Windows\Fonts\Roboto-Regular.ttf"),
+                    Path(r"C:\Windows\Fonts\arialbd.ttf" if bold else r"C:\Windows\Fonts\arial.ttf"),
+                    Path(r"C:\Windows\Fonts\segoeuib.ttf" if bold else r"C:\Windows\Fonts\segoeui.ttf"),
                 ]
             )
         candidates.extend(
             [
-                str(pil_font_dir / "DejaVuSans-Bold.ttf") if bold else str(pil_font_dir / "DejaVuSans.ttf"),
-                str(pil_font_dir / "fonts" / "DejaVuSans-Bold.ttf")
+                pil_font_dir / ("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"),
+                pil_font_dir / "fonts" / ("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"),
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
                 if bold
-                else str(pil_font_dir / "fonts" / "DejaVuSans.ttf"),
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+                else Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf")
                 if bold
-                else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
-                if bold
-                else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+                else Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
             ]
         )
 
         for path in candidates:
-            if path and os.path.exists(path):
+            path_str = str(path)
+            logger.info("Checking font candidate: %s", path_str)
+            if path and os.path.exists(path_str):
                 try:
-                    return ImageFont.truetype(path, size=size)
+                    font = ImageFont.truetype(path_str, size=size)
+                    font_name = None
+                    try:
+                        font_name = font.getname()
+                    except Exception:
+                        font_name = None
+                    logger.info(
+                        "Loaded %s font from %s%s",
+                        font_kind,
+                        path_str,
+                        f" ({font_name[0]}, {font_name[1]})" if font_name else "",
+                    )
+                    return font
                 except Exception:
+                    logger.warning("Failed to load font candidate: %s", path_str, exc_info=True)
                     continue
 
+        logger.warning("Falling back to Pillow default font for %s font at size %s", font_kind, size)
         return ImageFont.load_default()
 
     @staticmethod
@@ -389,6 +415,12 @@ class FieldStatusBot(commands.Bot):
 
         field_font = self._load_font(64, bold=True)
         extension_font = self._load_font(28, bold=True)
+        logger.info(
+            "%s renderer font metrics: field_font=%s extension_font=%s",
+            park,
+            getattr(field_font, "size", "unknown"),
+            getattr(extension_font, "size", "unknown"),
+        )
         card_fill = "#171b22"
         card_outline = "#2a313c"
         card_text = "#ffffff"
