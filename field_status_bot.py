@@ -745,7 +745,14 @@ class FieldStatusBot(commands.Bot):
             self.feed_state["last_entry_key"] = entry_key
             self.feed_state["last_status"] = self.summarize_statuses(statuses)
             await self._persist_feed_state()
-            await self._append_history_entry(entry, content, pub_date, statuses, entry_key)
+            try:
+                await self._append_history_entry(entry, content, pub_date, statuses, entry_key)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to append feed history entry; continuing with posted status message: %s",
+                    exc,
+                    exc_info=True,
+                )
 
             await self._cleanup_channel_messages(channel, message_id)
 

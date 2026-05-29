@@ -128,19 +128,34 @@ class Database:
 
     async def add_history_entry(self, feed_id: str, entry: Dict) -> bool:
         async with self.pool.acquire() as conn:
+            entry_key = entry.get("entry_key")
+
+            if entry_key:
+                existing = await conn.fetchval(
+                    """
+                    SELECT 1
+                    FROM feed_history
+                    WHERE feed_id = $1 AND entry_key = $2
+                    LIMIT 1
+                    """,
+                    feed_id,
+                    entry_key,
+                )
+                if existing:
+                    return False
+
             result = await conn.execute(
                 """
                 INSERT INTO feed_history
                     (feed_id, pub_date, title, content, entry_key,
                      status, closed_fields, contains_soccer)
                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
-                ON CONFLICT (feed_id, entry_key) DO NOTHING
                 """,
                 feed_id,
                 entry.get("pub_date"),
                 entry.get("title", ""),
                 entry.get("content", ""),
-                entry.get("entry_key"),
+                entry_key,
                 entry.get("status"),
                 json.dumps(entry.get("closed_fields", [])),
                 entry.get("contains_soccer", False),
