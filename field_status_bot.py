@@ -790,9 +790,7 @@ class FieldStatusBot(commands.Bot):
 
     async def on_ready(self):
         logger.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "unknown")
-        if not self._bootstrapped:
-            self._bootstrapped = True
-            await self.sync_latest_entry(force_refresh=self.is_dev_mode)
+        self._bootstrapped = True
 
     @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
     async def poll_feed(self):
