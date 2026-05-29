@@ -46,7 +46,7 @@ POLL_INTERVAL_MINUTES = int(os.getenv("POLL_INTERVAL_MINUTES", "2"))
 DEV_CHANNEL_ID = 1412578432629346314
 
 FIELD_LAYOUT = {
-    "Palmer": list(range(1, 11)),
+    "Palmer": [1, 2, 3, 4, 5, 7, 8, 9, 10],
     "Dublin": list(range(1, 10)),
 }
 
@@ -371,14 +371,14 @@ class FieldStatusBot(commands.Bot):
         bottom_margin = 54
         gap = 18
         card_width = (width - left_margin - right_margin - gap * (columns - 1)) // columns
-        card_height = 160
+        card_height = 190
         height = top_margin + bottom_margin + rows * card_height + (rows - 1) * gap
 
         background = Image.new("RGBA", (width, height), "#0f1218")
         draw = ImageDraw.Draw(background)
 
-        field_font = self._load_font(54, bold=True)
-        extension_font = self._load_font(24, bold=True)
+        field_font = self._load_font(72, bold=True)
+        extension_font = self._load_font(30, bold=True)
         card_fill = "#171b22"
         card_outline = "#2a313c"
         card_text = "#ffffff"
@@ -415,7 +415,7 @@ class FieldStatusBot(commands.Bot):
                 secondary_height = secondary_bbox[3] - secondary_bbox[1]
 
             text_width = max(primary_width, secondary_width)
-            text_height = primary_height + (6 + secondary_height if secondary_label else 0)
+            text_height = primary_height + (8 + secondary_height if secondary_label else 0)
             group_width = indicator_size + indicator_spacing + text_width
             group_height = max(indicator_size, text_height)
 
@@ -448,7 +448,7 @@ class FieldStatusBot(commands.Bot):
 
             if secondary_label:
                 draw.text(
-                    (text_x, text_y + primary_height + 6),
+                    (text_x, text_y + primary_height + 8),
                     secondary_label,
                     font=extension_font,
                     fill=extension_text,

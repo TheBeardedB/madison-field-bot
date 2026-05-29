@@ -8,10 +8,9 @@ A focused Discord bot that monitors the Madison Parks RSS feed, keeps a lightwei
 - Edits one persistent Discord message instead of posting new messages
 - Uses the embed title as a clickable link to the RSS post
 - Puts the RSS content in the embed body
-- Shows Palmer soccer field status for fields 1 to 10
+- Shows Palmer soccer field status for fields 1 to 5 and 7 to 10
 - Shows Dublin soccer field status for fields 1 to 9
-- Stores a compact history in `field_status_history.json`
-- Stores the current message state in `field_status_state.json`
+- Stores current status and history in the database
 
 ## Setup
 
@@ -51,12 +50,12 @@ Each update uses:
 
 ## History And State
 
-- `field_status_history.json` keeps the latest history entries
-- `field_status_state.json` remembers the Discord message id and last processed RSS entry
+- `feed_status` keeps the current Discord message id and last processed RSS entry
+- `feed_history` keeps the processed RSS history entries
 
 ## Field Mapping
 
-- Palmer: soccer fields 1 through 10
+- Palmer: soccer fields 1 through 5 and 7 through 10
 - Dublin: soccer fields 1 through 9
 
 ## Troubleshooting
