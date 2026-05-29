@@ -8,6 +8,7 @@ import tempfile
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from html import unescape
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -60,7 +61,7 @@ IMAGE_THEME_COLORS = {
     "Dublin": "#7d5ba6",
 }
 
-IMAGE_RENDER_VERSION = "2026-05-29-2"
+IMAGE_RENDER_VERSION = "2026-05-29-3"
 
 
 class FieldStatusBot(commands.Bot):
@@ -312,6 +313,7 @@ class FieldStatusBot(commands.Bot):
     @staticmethod
     def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         candidates = []
+        pil_font_dir = Path(ImageFont.__file__).resolve().parent
         if os.name == "nt":
             candidates.extend(
                 [
@@ -321,6 +323,10 @@ class FieldStatusBot(commands.Bot):
             )
         candidates.extend(
             [
+                str(pil_font_dir / "DejaVuSans-Bold.ttf") if bold else str(pil_font_dir / "DejaVuSans.ttf"),
+                str(pil_font_dir / "fonts" / "DejaVuSans-Bold.ttf")
+                if bold
+                else str(pil_font_dir / "fonts" / "DejaVuSans.ttf"),
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
                 if bold
                 else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -381,8 +387,8 @@ class FieldStatusBot(commands.Bot):
         background = Image.new("RGBA", (width, height), "#0f1218")
         draw = ImageDraw.Draw(background)
 
-        field_font = self._load_font(56, bold=True)
-        extension_font = self._load_font(30, bold=True)
+        field_font = self._load_font(64, bold=True)
+        extension_font = self._load_font(28, bold=True)
         card_fill = "#171b22"
         card_outline = "#2a313c"
         card_text = "#ffffff"
