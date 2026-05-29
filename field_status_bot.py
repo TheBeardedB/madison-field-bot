@@ -60,6 +60,8 @@ IMAGE_THEME_COLORS = {
     "Dublin": "#7d5ba6",
 }
 
+IMAGE_RENDER_VERSION = "2026-05-29-2"
+
 
 class FieldStatusBot(commands.Bot):
     def __init__(self):
@@ -88,6 +90,7 @@ class FieldStatusBot(commands.Bot):
             "last_entry_key": None,
             "last_message_id": None,
             "last_status": None,
+            "render_version": None,
         }
 
     async def _load_feed_state(self) -> Dict[str, Optional[str]]:
@@ -104,6 +107,7 @@ class FieldStatusBot(commands.Bot):
             last_entry_key=self.feed_state.get("last_entry_key"),
             last_message_id=self.feed_state.get("last_message_id"),
             last_status=self.feed_state.get("last_status"),
+            render_version=self.feed_state.get("render_version"),
         )
 
     # ------------------------------------------------------------------
@@ -747,6 +751,7 @@ class FieldStatusBot(commands.Bot):
             self.feed_state["last_pub_date"] = pub_date
             self.feed_state["last_entry_key"] = entry_key
             self.feed_state["last_status"] = self.summarize_statuses(statuses)
+            self.feed_state["render_version"] = IMAGE_RENDER_VERSION
             await self._persist_feed_state()
             try:
                 await self._append_history_entry(
@@ -792,7 +797,21 @@ class FieldStatusBot(commands.Bot):
             return
 
         self._bootstrapped = True
-        await self.sync_latest_entry(force_refresh=True)
+
+        needs_refresh = self.feed_state.get("render_version") != IMAGE_RENDER_VERSION
+        if not needs_refresh and self.feed_state.get("last_message_id"):
+            channel = await self._resolve_channel()
+            if channel:
+                try:
+                    await channel.fetch_message(int(self.feed_state["last_message_id"]))
+                except discord.NotFound:
+                    needs_refresh = True
+                except Exception as exc:
+                    logger.warning("Could not verify the stored Discord message on startup: %s", exc, exc_info=True)
+
+        if needs_refresh:
+            await self.sync_latest_entry(force_refresh=True)
+
         if not self.poll_feed.is_running():
             self.poll_feed.start()
 

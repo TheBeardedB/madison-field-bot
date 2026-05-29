@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS feed_status (
     last_entry_key    TEXT,
     last_message_id   TEXT,
     last_status       TEXT,
+    render_version    TEXT,
     updated_at        TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -57,18 +58,22 @@ class Database:
             )
 
             await conn.execute(SCHEMA)
+            await conn.execute(
+                "ALTER TABLE feed_status ADD COLUMN IF NOT EXISTS render_version TEXT"
+            )
 
             if legacy_state_exists and not status_exists:
                 await conn.execute(
                     """
                     INSERT INTO feed_status
-                        (feed_id, last_pub_date, last_entry_key, last_message_id, last_status, updated_at)
+                        (feed_id, last_pub_date, last_entry_key, last_message_id, last_status, render_version, updated_at)
                     SELECT DISTINCT ON (feed_id)
                         feed_id,
                         last_pub_date,
                         NULL,
                         last_message_id,
                         last_status,
+                        NULL,
                         COALESCE(updated_at, NOW())
                     FROM feed_state
                     ORDER BY feed_id, updated_at DESC
@@ -77,6 +82,7 @@ class Database:
                             last_entry_key = EXCLUDED.last_entry_key,
                             last_message_id = EXCLUDED.last_message_id,
                             last_status = EXCLUDED.last_status,
+                            render_version = EXCLUDED.render_version,
                             updated_at = EXCLUDED.updated_at
                     """
                 )
@@ -91,7 +97,7 @@ class Database:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT last_pub_date, last_entry_key, last_message_id, last_status
+                SELECT last_pub_date, last_entry_key, last_message_id, last_status, render_version
                 FROM feed_status
                 WHERE feed_id = $1
                 """,
@@ -106,18 +112,20 @@ class Database:
         last_entry_key: Optional[str] = None,
         last_message_id: Optional[str] = None,
         last_status: Optional[str] = None,
+        render_version: Optional[str] = None,
     ) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO feed_status
-                    (feed_id, last_pub_date, last_entry_key, last_message_id, last_status, updated_at)
-                VALUES ($1, $2, $3, $4, $5, NOW())
+                    (feed_id, last_pub_date, last_entry_key, last_message_id, last_status, render_version, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
                 ON CONFLICT (feed_id) DO UPDATE
                     SET last_pub_date = EXCLUDED.last_pub_date,
                         last_entry_key = EXCLUDED.last_entry_key,
                         last_message_id = EXCLUDED.last_message_id,
                         last_status = EXCLUDED.last_status,
+                        render_version = EXCLUDED.render_version,
                         updated_at = NOW()
                 """,
                 feed_id,
@@ -125,6 +133,7 @@ class Database:
                 last_entry_key,
                 last_message_id,
                 last_status,
+                render_version,
             )
 
     async def add_history_entry(self, guild_id: int, feed_id: str, entry: Dict) -> bool:
