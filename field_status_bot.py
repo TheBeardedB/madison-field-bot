@@ -61,7 +61,7 @@ IMAGE_THEME_COLORS = {
     "Dublin": "#7d5ba6",
 }
 
-IMAGE_RENDER_VERSION = "2026-05-29-4"
+IMAGE_RENDER_VERSION = "2026-05-29-6"
 
 
 class FieldStatusBot(commands.Bot):
@@ -316,13 +316,35 @@ class FieldStatusBot(commands.Bot):
         repo_dir = Path(__file__).resolve().parent
         pil_font_dir = Path(ImageFont.__file__).resolve().parent
         font_kind = "bold" if bold else "regular"
-        logger.info("Loading %s font at size %s", font_kind, size)
+        roboto_root = repo_dir / "Roboto"
+        roboto_static_dir = roboto_root / "static"
+        logger.info(
+            "Loading %s font at size %s from repo Roboto folder %s",
+            font_kind,
+            size,
+            roboto_root,
+        )
+        if roboto_static_dir.exists():
+            static_candidates = sorted(
+                roboto_static_dir.glob("*.ttf"),
+                key=lambda path: (
+                    0 if bold and "bold" in path.name.lower() else 1 if bold else 0 if "regular" in path.name.lower() or "variable" in path.name.lower() else 1,
+                    path.name.lower(),
+                ),
+            )
+            candidates.extend(static_candidates)
+            logger.info(
+                "Found %s Roboto static font candidate(s) in %s",
+                len(static_candidates),
+                roboto_static_dir,
+            )
+            for path in static_candidates:
+                logger.info("Roboto static candidate: %s", path)
         candidates.extend(
             [
-                repo_dir / "fonts" / ("Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"),
-                repo_dir / "font" / ("Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"),
-                repo_dir / "assets" / "fonts" / ("Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"),
-                repo_dir / "assets" / "font" / ("Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"),
+                roboto_root / "Roboto-VariableFont_wdth,wght.ttf",
+                roboto_root / "Roboto-Regular.ttf",
+                roboto_root / "Roboto-Bold.ttf",
             ]
         )
         if os.name == "nt":
@@ -343,11 +365,15 @@ class FieldStatusBot(commands.Bot):
                 Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf")
                 if bold
                 else Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
-            ]
-        )
+                ]
+            )
 
+        seen = set()
         for path in candidates:
             path_str = str(path)
+            if path_str in seen:
+                continue
+            seen.add(path_str)
             logger.info("Checking font candidate: %s", path_str)
             if path and os.path.exists(path_str):
                 try:
