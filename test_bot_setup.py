@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-Test the fixed Discord bot command registration
+Quick startup smoke test for the field status bot
 """
 
 import asyncio
 import discord
-from discord.ext import commands
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
 async def test_bot_setup():
-    """Test that the bot can start and register commands without errors"""
+    """Test that the bot can be created and connect with the configured token."""
     
     TOKEN = os.getenv('DISCORD_BOT_TOKEN')
     if not TOKEN:
         print("❌ DISCORD_BOT_TOKEN not found in .env file")
         return
     
-    print("🤖 Testing bot startup and command registration...")
+    print("🤖 Testing bot startup...")
     
-    # Import the fixed bot
     from field_status_bot import FieldStatusBot
     
     bot = FieldStatusBot()
@@ -29,12 +27,7 @@ async def test_bot_setup():
     @bot.event
     async def on_ready():
         print(f'✅ Bot connected as {bot.user.name}')
-        print(f'🔍 Registered commands: {len(bot.tree.get_commands())}')
-        
-        # List all registered commands
-        for cmd in bot.tree.get_commands():
-            print(f'   - /{cmd.name}: {cmd.description}')
-        
+        print('📡 The bot is ready to poll the RSS feed and maintain the single status message.')
         print("🎉 Bot setup test completed successfully!")
         await bot.close()
     
@@ -48,7 +41,7 @@ async def test_bot_setup():
 def main():
     print("🚀 Testing Fixed Discord Bot")
     print("=" * 40)
-    print("This will test that the bot can start and register commands properly.")
+    print("This will test that the bot can start and connect properly.")
     print()
     
     try:

@@ -27,7 +27,8 @@ def check_environment():
     # Check required environment variables
     token = os.getenv('DISCORD_BOT_TOKEN')
     channel_id = os.getenv('DISCORD_CHANNEL_ID')
-    
+    feed_url = os.getenv('RSS_FEED_URL')
+
     if not token:
         print("❌ DISCORD_BOT_TOKEN not set in .env file")
         return False
@@ -38,6 +39,10 @@ def check_environment():
     
     print("✅ DISCORD_BOT_TOKEN is set")
     print("✅ DISCORD_CHANNEL_ID is set")
+    if feed_url:
+        print("✅ RSS_FEED_URL is set")
+    else:
+        print("ℹ️  RSS_FEED_URL not set; the bot will use the default Madison feed")
     
     # Validate token format
     if not (token.startswith('MT') or token.startswith('MTE')) or len(token) < 50:
@@ -100,11 +105,9 @@ def check_files():
     ]
     
     optional_files = [
-        'DISCORD_PERMISSIONS_GUIDE.md',
-        'USAGE_GUIDE.md',
         'README.md',
-        'sync_dev_commands.py',
-        'clear_commands.py'
+        'field_status_history.json',
+        'field_status_state.json'
     ]
     
     all_good = True
@@ -144,13 +147,10 @@ def main():
         print("\nNext steps:")
         print("1. Make sure your Discord bot is invited to your server")
         print("2. Start the bot: ./run_bot.sh (or run_bot.bat on Windows)")
-        print("3. Slash commands may take up to 1 hour to appear globally")
-        print("4. For immediate testing: python sync_dev_commands.py")
-        print("5. Test permissions with: /check_permissions")
+        print("3. The bot will create or update one message in the configured channel")
         print("\n💡 Troubleshooting:")
-        print("- If slash commands don't appear: Use sync_dev_commands.py")
-        print("- If permission errors occur: See DISCORD_PERMISSIONS_GUIDE.md")
-        print("- Bot won't repost the same update after restart (uses RSS pubDate)")
+        print("- If the message does not update: verify channel permissions and RSS access")
+        print("- History is stored in field_status_history.json and the current message id in field_status_state.json")
     else:
         print("❌ Some issues found. Please fix the above errors before running the bot.")
         

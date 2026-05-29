@@ -1,2067 +1,814 @@
-import os
-import sys
-import logging
-import re
-import json
 import asyncio
-import random
-import copy
 import hashlib
-from datetime import datetime, timedelta
+import logging
+import os
+import re
+import sys
+import tempfile
+from datetime import datetime
 from email.utils import parsedate_to_datetime
-from typing import Dict, List, Optional, Tuple
+from html import unescape
+from typing import Dict, List, Optional
 
+import aiohttp
 import discord
-from discord.ext import tasks, commands
-from discord import app_commands
 import feedparser
 import pytz
-import aiohttp
+from PIL import Image, ImageDraw, ImageFont
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from db import Database
-from llm_field_parser import GitHubModelsFieldParser
 
 load_dotenv()
 
-# On Windows, request UTF-8 console output
-if os.name == 'nt':
-    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
-    try:
-        import subprocess
-        subprocess.run(['chcp', '65001'], shell=True, capture_output=True)
-    except Exception:
-        pass
+if os.name == "nt":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-
 console_handler = logging.StreamHandler(sys.stdout)
 try:
-    console_handler.stream.reconfigure(encoding='utf-8')
+    console_handler.stream.reconfigure(encoding="utf-8")
 except (AttributeError, OSError):
     pass
-console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(formatter)
 
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
-root_logger.addHandler(console_handler)
-
-# Console-only logging so output is visible in Railway logs.
+if not any(isinstance(handler, logging.StreamHandler) for handler in root_logger.handlers):
+    root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_FEED_URL = "https://www.madisonal.gov/RSSFeed.aspx?ModID=1&CID=Field-Status-6"
+NEWSFLASH_URL = "https://www.madisonal.gov/m/newsflash?cat=6"
+POLL_INTERVAL_MINUTES = int(os.getenv("POLL_INTERVAL_MINUTES", "2"))
+DEV_CHANNEL_ID = 1412578432629346314
 
-def safe_log(level, message):
-    """Safely log a message, handling Unicode encoding issues"""
-    try:
-        if level == 'info':
-            logger.info(message)
-        elif level == 'error':
-            logger.error(message)
-        elif level == 'warning':
-            logger.warning(message)
-        elif level == 'debug':
-            logger.debug(message)
-    except UnicodeEncodeError:
-        # Fallback: remove or replace problematic characters
-        safe_message = message.encode('ascii', errors='replace').decode('ascii')
-        if level == 'info':
-            logger.info(f"[Unicode Error - Original message contained special characters] {safe_message}")
-        elif level == 'error':
-            logger.error(f"[Unicode Error - Original message contained special characters] {safe_message}")
-        elif level == 'warning':
-            logger.warning(f"[Unicode Error - Original message contained special characters] {safe_message}")
-        elif level == 'debug':
-            logger.debug(f"[Unicode Error - Original message contained special characters] {safe_message}")
+FIELD_LAYOUT = {
+    "Palmer": list(range(1, 11)),
+    "Dublin": list(range(1, 10)),
+}
+
+IMAGE_CARD_COLORS = {
+    "open": "#2ecc71",
+    "closed": "#e74c3c",
+}
+
+IMAGE_THEME_COLORS = {
+    "Palmer": "#2d7dd2",
+    "Dublin": "#7d5ba6",
+}
 
 
 class FieldStatusBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(command_prefix="/", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, help_command=None)
 
         self.CST = pytz.timezone("US/Central")
-        self.CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
-        self.CONFIG_FILE = "bot_config.json"
+        self.channel_id = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+        self.is_dev_mode = self.channel_id == DEV_CHANNEL_ID
+        self.feed_url = os.getenv("RSS_FEED_URL", DEFAULT_FEED_URL).strip()
+        self.db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("POSTGRESQL_URL") or ""
+        self.db = Database(self.db_url)
+        self.feed_id = os.getenv("FEED_ID", "madison-field-status")
+        self.feed_state: Dict[str, Optional[str]] = self._default_feed_state()
+        self._poll_lock = asyncio.Lock()
+        self._bootstrapped = False
 
-        # Populated in setup_hook from DB (Railway) or JSON file (local)
-        self.config: Dict = {"guilds": {}}
-        # {'{guild_id}:{feed_id}': last_pub_date} — in-memory cache, backed by DB
-        self._feed_last_pub_dates: Dict[str, str] = {}
-        # Guards against concurrent duplicate processing for the same feed
-        self._feed_processing: set[str] = set()
-        # Database handle; None when running without DATABASE_URL
-        self.db: Optional[Database] = None
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
 
-        self.STATUS_COLORS = {
-            "open": 0x00FF00,
-            "partial": 0xFF8C00,
-            "closed": 0xFF0000,
-        }
-        self.github_models_field_parser = GitHubModelsFieldParser()
-
-    # ── Config helpers ────────────────────────────────────────────────────────
-
-    DEFAULT_GUILD_CONFIG = {
-        "feeds": {},
-        "role_pings": {},
-        "global_settings": {"timezone": "US/Central", "default_embed_color": 0x5865F2},
-    }
-
-    DEFAULT_FEED_CONFIG = {
-        "name": "RSS Feed",
-        "url": "",
-        "channel_id": None,
-        "enabled": True,
-        "check_intervals": {"normal": 20, "peak": 5, "frequent": 1, "weather": 5},
-        "schedule": {
-            "peak_times": [
-                {"start": "14:30", "end": "15:30", "days": [0, 1, 2, 3, 4]},
-                {"start": "07:30", "end": "08:30", "days": [5, 6]},
-            ],
-            "weather_check": False,
-            "weather_location": "",
-        },
-        "processing": {
-            "content_parser": "generic",
-            "status_colors": {
-                "default": 0x3498DB,
-                "success": 0x00FF00,
-                "warning": 0xFF8C00,
-                "error": 0xFF0000,
-            },
-        },
-        "embed_template": {
-            "title_template": "{title}",
-            "description_template": "{content}",
-            "footer_text": "RSS Feed Update",
-            "thumbnail_url": None,
-            "fields": [],
-        },
-        "history": {"enabled": True},
-    }
-
-    def _apply_config_defaults(self, config: Dict) -> Dict:
-        """Fill in any missing keys on a loaded config dict."""
-        for guild_id, guild_config in config.get("guilds", {}).items():
-            for k, v in self.DEFAULT_GUILD_CONFIG.items():
-                if k not in guild_config:
-                    guild_config[k] = copy.deepcopy(v)
-            # Remove stale guild-level keys.
-            for stale_key in list(guild_config.keys()):
-                if stale_key not in self.DEFAULT_GUILD_CONFIG:
-                    del guild_config[stale_key]
-            for feed_id, feed_config in guild_config.get("feeds", {}).items():
-                for k, v in self.DEFAULT_FEED_CONFIG.items():
-                    if k not in feed_config:
-                        feed_config[k] = copy.deepcopy(v)
-                # Remove stale top-level feed keys.
-                for stale_key in list(feed_config.keys()):
-                    if stale_key not in self.DEFAULT_FEED_CONFIG:
-                        del feed_config[stale_key]
-                # Remove stale processing/history keys.
-                allowed_processing = set(self.DEFAULT_FEED_CONFIG["processing"].keys())
-                for stale_key in list(feed_config["processing"].keys()):
-                    if stale_key not in allowed_processing:
-                        del feed_config["processing"][stale_key]
-                allowed_history = set(self.DEFAULT_FEED_CONFIG["history"].keys())
-                for stale_key in list(feed_config["history"].keys()):
-                    if stale_key not in allowed_history:
-                        del feed_config["history"][stale_key]
-        return config
-
-    def _load_config_from_json(self) -> Dict:
-        """Load config from local JSON file (used when no DATABASE_URL)."""
-        try:
-            if os.path.exists(self.CONFIG_FILE):
-                with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                return self._apply_config_defaults(config)
-        except Exception as e:
-            logger.error(f"Error loading config from JSON: {e}")
-        return {"guilds": {}}
-
-    def _save_config_to_json(self):
-        """Write config to local JSON file."""
-        try:
-            with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving config to JSON: {e}")
-
-    def save_config(self):
-        """Persist config — DB when available, JSON file otherwise."""
-        if self.db:
-            if not hasattr(self, "_config_save_tasks"):
-                self._config_save_tasks = set()
-            for guild_id, guild_config in self.config["guilds"].items():
-                task = asyncio.create_task(self.db.save_guild_config(guild_id, guild_config))
-                self._config_save_tasks.add(task)
-                task.add_done_callback(self._config_save_tasks.discard)
-                task.add_done_callback(self._log_config_save_error)
-        else:
-            self._save_config_to_json()
-
-    def _log_config_save_error(self, task: asyncio.Task):
-        try:
-            task.result()
-        except Exception as e:
-            logger.error(f"Failed to save config: {e}", exc_info=True)
-    
-    def get_guild_config(self, guild_id: int) -> Dict:
-        """Return (and lazily create) the in-memory config for a guild."""
-        guild_id_str = str(guild_id)
-        if guild_id_str not in self.config["guilds"]:
-            self.config["guilds"][guild_id_str] = copy.deepcopy(self.DEFAULT_GUILD_CONFIG)
-            self.save_config()
-        return self.config["guilds"][guild_id_str]
-
-    def get_feed_config(self, guild_id: int, feed_id: str) -> Optional[Dict]:
-        return self.get_guild_config(guild_id)["feeds"].get(feed_id)
-
-    def _log_config_snapshot(self, context: str):
-        """Emit a compact config snapshot for startup/troubleshooting."""
-        try:
-            guilds = self.config.get("guilds", {})
-            total_feeds = sum(len(g.get("feeds", {})) for g in guilds.values())
-            enabled_feeds = sum(
-                1
-                for g in guilds.values()
-                for f in g.get("feeds", {}).values()
-                if f.get("enabled", True)
-            )
-            logger.info(
-                f"[ConfigSnapshot:{context}] db_mode={'db' if self.db else 'json'} "
-                f"guild_count={len(guilds)} total_feeds={total_feeds} enabled_feeds={enabled_feeds}"
-            )
-
-            if not guilds:
-                logger.warning(
-                    f"[ConfigSnapshot:{context}] No guild configs loaded. "
-                    "Bot will check 0 guilds until a guild/feed config exists in this environment."
-                )
-                return
-
-            for guild_id, guild_cfg in guilds.items():
-                feeds = guild_cfg.get("feeds", {})
-                if not feeds:
-                    logger.info(f"[ConfigSnapshot:{context}] guild={guild_id} feeds=0")
-                    continue
-                for feed_id, feed_cfg in feeds.items():
-                    parser_type = (
-                        feed_cfg.get("processing", {}).get("content_parser", "unknown")
-                    )
-                    channel_id = feed_cfg.get("channel_id")
-                    enabled = feed_cfg.get("enabled", True)
-                    logger.info(
-                        f"[ConfigSnapshot:{context}] guild={guild_id} feed_id={feed_id} "
-                        f"enabled={enabled} parser={parser_type} channel_id={channel_id}"
-                    )
-        except Exception as e:
-            logger.error(f"[ConfigSnapshot:{context}] Failed to summarize config: {e}")
-
-
-    def parse_field_status(self, content: str) -> Tuple[str, List[str], bool, List[str]]:
-        """
-        Parse field status from RSS content
-        Returns: (overall_status, closed_fields, contains_soccer, open_fields)
-        """
-        content_lower = content.lower()
-        closed_fields = []
-        open_fields = []
-        contains_soccer = "soccer" in content_lower
-
-        # Simple status classification per product rule:
-        # - only "open" -> open
-        # - both "open" and "closed" -> partial
-        # - only "closed" -> closed
-        has_open = bool(re.search(r"\bopen\b", content_lower))
-        has_closed = bool(re.search(r"\bclosed\b", content_lower))
-
-        if has_closed and not has_open:
-            # Only classify as fully closed when closure language is city-wide.
-            # Otherwise (specific fields/parks closed without any "open" text),
-            # continue into partial extraction logic below.
-            citywide_closed_patterns = [
-                r"\ball fields are closed\b",
-                r"\ball fields closed\b",
-                r"\ball fields are currently closed\b",
-                r"\ball fields currently closed\b",
-                r"\ball parks are closed\b",
-                r"\ball parks closed\b",
-            ]
-            both_parks_closed = (
-                "all fields at" in content_lower
-                and "dublin park" in content_lower
-                and "palmer park" in content_lower
-                and "closed" in content_lower
-            )
-            if any(re.search(p, content_lower) for p in citywide_closed_patterns) or both_parks_closed:
-                return "closed", ["All Fields"], contains_soccer, []
-        if has_open and not has_closed:
-            return "open", [], contains_soccer, []
-
-        canonical_fields = [
-            "All Fields",
-            "Palmer Park",
-            "Dublin Park",
-            "Palmer Soccer 1",
-            "Palmer Soccer 2",
-            "Palmer Soccer 2&3",
-            "Palmer Soccer 3",
-            "Palmer Soccer 4",
-            "Palmer Soccer 5",
-            "Palmer Soccer 6",
-            "Palmer Soccer 7",
-            "Palmer Soccer 7-10",
-            "Palmer Soccer 8",
-            "Palmer Soccer 9",
-            "Palmer Soccer 10",
-            "Dublin Soccer 1",
-            "Dublin Soccer 2",
-            "Dublin Fields",
-            "Wellness Center Fields",
-            "Westco 4",
-            "Westco Field 5",
-            "Westco Fields 2 & 3",
-            "Palmer Baseball",
-            "Palmer Baseball 5",
-            "Palmer Softball",
-            "Palmer Expansion Soccer Fields",
-        ]
-
-        # If neither keyword is present, default to open.
-        if not has_open and not has_closed:
-            return "open", [], contains_soccer, []
-
-        # Normalize date/update prefixes early so downstream patterns do not
-        # accidentally capture date fragments as field names.
-        clean_content = re.sub(r"^\d+\.\d+\.\d+\s*-\s*", "", content_lower)
-        clean_content = re.sub(r"^\d+\.\d+\.\d+\s*update:\s*", "", clean_content)
-        clean_content = re.sub(r"^\d+\.\d+\.\d+\s*updated:\s*", "", clean_content)
-
-        # Normalize specific phrasing to canonical field names.
-        if re.search(r"\bsoftball fields?\s+at\s+palmer park\b.*\bclosed\b", content_lower):
-            closed_fields.append("Palmer Softball")
-
-        # Extract specific field names that are mentioned as closed
-        field_patterns = [
-            # Specific field patterns
-            r"(palmer soccer \d+(?:&\d+)?(?:-\d+)?)",
-            r"(dublin soccer \d+)",
-            r"(palmer baseball \d*)",
-            r"(palmer softball)",
-            r"(westco field \d+)",
-            r"(westco fields \d+ & \d+)",
-            r"(westco \d+)",
-            r"(wellness center fields)",
-            r"(dublin fields)",
-            r"(palmer expansion soccer fields)",
-            # Park-wide patterns
-            r"all fields at (palmer park)",
-            r"all fields at (dublin park)",
-            r"all (dublin park) fields",
-        ]
-
-        for pattern in field_patterns:
-            matches = re.finditer(pattern, content_lower)
-            for match in matches:
-                field_name = match.group(1)
-                # Clean up the field name
-                if field_name:
-                    # Convert to title case and clean up
-                    field_name = " ".join(
-                        word.capitalize() for word in field_name.split()
-                    )
-                    if field_name not in closed_fields:
-                        closed_fields.append(field_name)
-
-        # Parse explicit OPEN/CLOSED lines to support partial lists from city updates.
-        # Example: "Palmer Soccer 1, Dublin Soccer 2 - OPEN"
-        open_line_pattern = r"([a-zA-Z0-9\s,&\-\/]+?)\s*-\s*open"
-        closed_line_pattern = r"([a-zA-Z0-9\s,&\-\/]+?)\s*-\s*closed"
-
-        def append_field_list(raw_text: str, target: List[str]):
-            parts = re.split(r",\s*| and ", raw_text)
-            for part in parts:
-                candidate = " ".join(part.strip().split())
-                candidate = re.sub(r"[\s\-;:,]+$", "", candidate)
-                if 3 < len(candidate) < 40:
-                    candidate = " ".join(word.capitalize() for word in candidate.split())
-                    if candidate.lower() not in {"all fields", "all field"} and candidate not in target:
-                        target.append(candidate)
-
-        for match in re.finditer(open_line_pattern, clean_content):
-            append_field_list(match.group(1), open_fields)
-
-        for match in re.finditer(closed_line_pattern, clean_content):
-            append_field_list(match.group(1), closed_fields)
-
-        # More precise parsing for field closures - only look for clear patterns
-
-        # Look for comma-separated list before "closed"
-        list_closure_pattern = r"^([^.]+?)\s+(?:all\s+)?closed\s*[.;]"
-        list_match = re.search(list_closure_pattern, clean_content)
-
-        if list_match:
-            field_list_text = list_match.group(1).strip()
-
-            # Skip if it mentions "all fields" or similar
-            if not any(
-                skip in field_list_text
-                for skip in ["all field", "all park", "due to", "because"]
-            ):
-                # Split by commas and clean up each field
-                field_parts = re.split(r",\s*(?:and\s+)?", field_list_text)
-
-                for part in field_parts:
-                    part = part.strip()
-                    part = re.sub(r"\s+(?:are|is)\s*$", "", part)
-                    # Skip if too short or has common false matches
-                    if len(part) < 3 or any(
-                        skip in part for skip in ["will be", "for", "at", "on"]
-                    ):
-                        continue
-
-                    # Clean up field name
-                field_name = " ".join(word.capitalize() for word in part.split())
-                field_name = re.sub(r"[\s\-;:,]+$", "", field_name)
-                if field_name not in closed_fields and len(field_name) < 30:
-                    closed_fields.append(field_name)
-
-        # Also look for "Field - CLOSED" pattern specifically
-        dash_closed_pattern = r"([a-zA-Z\s\d&]+?)\s*-\s*closed"
-        dash_matches = re.finditer(dash_closed_pattern, clean_content)
-
-        for match in dash_matches:
-            field_name = match.group(1).strip()
-
-            # Clean up and validate
-            if 3 < len(field_name) < 30:
-                # Skip common false matches
-                if not any(
-                    skip in field_name.lower()
-                    for skip in ["update", "other field", "all field"]
-                ):
-                    field_name = " ".join(
-                        word.capitalize() for word in field_name.split()
-                    )
-                    field_name = re.sub(r"[\s\-;:,]+$", "", field_name)
-                    if field_name not in closed_fields:
-                        closed_fields.append(field_name)
-
-        # Clean up and deduplicate closed_fields
-        if closed_fields:
-            # Remove duplicates while preserving order
-            unique_fields = []
-            for field in closed_fields:
-                if field not in unique_fields:
-                    unique_fields.append(field)
-
-            # Filter out park names when specific fields from that park are mentioned
-            filtered_fields = []
-            for field in unique_fields:
-                field_lower = field.lower()
-                # Skip park-wide entries if we have specific fields from that park
-                if "palmer park" in field_lower:
-                    # Check if we have specific Palmer fields
-                    has_palmer_specifics = any(
-                        "palmer" in f.lower() and "park" not in f.lower()
-                        for f in unique_fields
-                    )
-                    if not has_palmer_specifics:
-                        filtered_fields.append(field)
-                elif "dublin park" in field_lower:
-                    # Check if we have specific Dublin fields
-                    has_dublin_specifics = any(
-                        "dublin" in f.lower() and "park" not in f.lower()
-                        for f in unique_fields
-                    )
-                    if not has_dublin_specifics:
-                        filtered_fields.append(field)
-                else:
-                    filtered_fields.append(field)
-
-            closed_fields = filtered_fields
-
-        # If we found specific closed fields, it's partial
-        if closed_fields:
-            # Optional GitHub Models assist for partial extraction.
-            # We only call it for messages that mention closures but are not already
-            # classified as city-wide open/closed above.
-            if "closed" in content_lower:
-                llm_result = self.github_models_field_parser.extract_closed_fields_with_llm(
-                    content, canonical_fields
-                )
-                llm_fields = llm_result.get("closed_fields", [])
-                llm_confidence = float(llm_result.get("confidence", 0.0))
-                llm_reason = llm_result.get("reason", "unknown")
-                llm_raw = llm_result.get("raw_closed_fields", [])
-
-                safe_log(
-                    "info",
-                    f"LLM partial parse attempted: reason={llm_reason}, "
-                    f"confidence={llm_confidence:.2f}, raw={llm_raw}, normalized={llm_fields}",
-                )
-
-                if llm_reason == "ok" and llm_fields:
-                    if llm_fields == ["All Fields"]:
-                        return "closed", ["All Fields"], contains_soccer, open_fields
-                    closed_fields = llm_fields
-
-            return "partial", closed_fields, contains_soccer, open_fields
-
-        # If regex finds no specific fields but text still indicates closure, let LLM try.
-        if "closed" in content_lower:
-            llm_result = self.github_models_field_parser.extract_closed_fields_with_llm(
-                content, canonical_fields
-            )
-            llm_fields = llm_result.get("closed_fields", [])
-            llm_confidence = float(llm_result.get("confidence", 0.0))
-            llm_reason = llm_result.get("reason", "unknown")
-            llm_raw = llm_result.get("raw_closed_fields", [])
-
-            safe_log(
-                "info",
-                f"LLM partial parse fallback: reason={llm_reason}, "
-                f"confidence={llm_confidence:.2f}, raw={llm_raw}, normalized={llm_fields}",
-            )
-
-            if llm_reason == "ok" and llm_fields:
-                if llm_fields == ["All Fields"]:
-                    return "closed", ["All Fields"], contains_soccer, open_fields
-                return "partial", llm_fields, contains_soccer, open_fields
-
-        # Default to open if no closure indicators
-        return "open", [], contains_soccer, open_fields
-
-    def should_post_update(
-        self,
-        status: str,
-        closed_fields: List[str],
-        contains_soccer: bool,
-        previous_status: Optional[str],
-    ) -> bool:
-        """
-        Return True when a city update is worth announcing.
-        pub-date dedup ensures this is only called once per new RSS entry.
-        """
-        # Product requirement: post every newly detected RSS item.
-        return True
-
-    def categorize_fields_by_location(self, closed_fields: List[str]) -> dict:
-        """Categorize closed fields by location (Dublin, Palmer, Other)"""
-        dublin_fields = []
-        palmer_fields = []
-        other_fields = []
-        
-        for field in closed_fields:
-            field_lower = field.lower()
-            if "dublin" in field_lower:
-                dublin_fields.append(field)
-            elif "palmer" in field_lower:
-                palmer_fields.append(field)
-            else:
-                other_fields.append(field)
-        
+    @staticmethod
+    def _default_feed_state() -> Dict[str, Optional[str]]:
         return {
-            "dublin": dublin_fields,
-            "palmer": palmer_fields,
-            "other": other_fields
+            "last_pub_date": None,
+            "last_entry_key": None,
+            "last_message_id": None,
+            "last_status": None,
         }
 
-    def create_status_embed(
-        self, status: str, closed_fields: List[str], content: str, timestamp: datetime
-    ) -> discord.Embed:
-        """Create Discord embed for field status update"""
+    async def _load_feed_state(self) -> Dict[str, Optional[str]]:
+        state = self._default_feed_state()
+        db_state = await self.db.get_feed_status(self.feed_id)
+        if db_state:
+            state.update({key: db_state.get(key) for key in state})
+        return state
 
-        # Determine title and color
-        if status == "open":
-            title = "🟢 Fields Open"
-            color = self.STATUS_COLORS["open"]
-        elif status == "closed":
-            title = "🔴 All Fields Closed"
-            color = self.STATUS_COLORS["closed"]
-        else:  # partial
-            title = "🟡 Some Fields Closed"
-            color = self.STATUS_COLORS["partial"]
-
-        embed = discord.Embed(title=title, color=color, timestamp=timestamp)
-
-        # Add field information
-        if status == "partial" and closed_fields:
-            # Categorize fields by location for partial closures
-            field_categories = self.categorize_fields_by_location(closed_fields)
-            
-            # Dublin section
-            dublin_value = "Open" if not field_categories["dublin"] else "\n".join([f"• {field}" for field in field_categories["dublin"]])
-            embed.add_field(name="Dublin", value=dublin_value, inline=True)
-            
-            # Palmer section  
-            palmer_value = "Open" if not field_categories["palmer"] else "\n".join([f"• {field}" for field in field_categories["palmer"]])
-            embed.add_field(name="Palmer", value=palmer_value, inline=True)
-            
-            # Other section
-            other_value = "Open" if not field_categories["other"] else "\n".join([f"• {field}" for field in field_categories["other"]])
-            embed.add_field(name="Other", value=other_value, inline=True)
-            
-        elif closed_fields:
-            # For non-partial status, use the original format
-            embed.add_field(
-                name="Closed Fields",
-                value="\n".join([f"• {field}" for field in closed_fields]),
-                inline=False,
-            )
-
-        # Add original content (truncated if too long)
-        content_preview = content[:500] + "..." if len(content) > 500 else content
-        embed.add_field(name="Details", value=content_preview, inline=False)
-
-        embed.set_footer(text="Madison Parks & Recreation")
-
-        return embed
-
-    async def send_status_update(
-        self, channel: discord.TextChannel, embed: discord.Embed, role_pings: dict = None
-    ):
-        """Send status update to channel with optional role ping"""
-        if role_pings is None:
-            # Look up from guild config
-            guild_config = self.get_guild_config(channel.guild.id)
-            role_pings = guild_config.get("role_pings", {})
-
-        channel_id_str = str(channel.id)
-        role_ids = role_pings.get(channel_id_str, [])
-
-        message_content = None
-        role_mentions = []
-
-        if role_ids:
-            for role_id in role_ids:
-                try:
-                    role = channel.guild.get_role(int(role_id))
-                    if role:
-                        role_mentions.append(role.mention)
-                        logger.info(f"Pinging role {role.name} in channel {channel.name}")
-                    else:
-                        logger.warning(
-                            f"Role {role_id} not found in guild {channel.guild.name}"
-                        )
-                except Exception as e:
-                    logger.error(f"Error getting role {role_id}: {e}")
-
-            if role_mentions:
-                embed_title = embed.title if embed.title else "Field Status Update"
-                message_content = f"{embed_title}\n\n" + " ".join(role_mentions)
-
-        await channel.send(content=message_content, embed=embed)
-
-    async def check_weather_conditions(self) -> bool:
-        """Check if rain or storms are forecast for Madison, AL today"""
-        try:
-            # Using a free weather API (you may need to get an API key)
-            # For now, this is a placeholder - you'll need to implement actual weather checking
-            # You could use OpenWeatherMap, WeatherAPI, or similar service
-            
-            # Placeholder logic - return False for now
-            # In a real implementation, you would:
-            # 1. Make API call to weather service for Madison, AL
-            # 2. Check today's forecast for rain/storms
-            # 3. Return True if rain/storms are forecast
-            
-            return False
-        except Exception as e:
-            logger.error(f"Error checking weather conditions: {e}")
-            return False
-
-    async def perform_immediate_feed_check(self):
-        """Perform an immediate check of all feeds on startup"""
-        logger.info("Performing immediate feed check on startup...")
-        try:
-            # Check all feeds regardless of their normal interval
-            for guild_id_str, guild_config in self.config["guilds"].items():
-                try:
-                    guild_id = int(guild_id_str)
-                    guild = self.get_guild(guild_id)
-                    
-                    if not guild:
-                        logger.debug(f"Guild {guild_id} not found during startup check")
-                        continue
-                    
-                    for feed_id, feed_config in guild_config["feeds"].items():
-                        if not feed_config["enabled"]:
-                            continue
-                        
-                        try:
-                            # Prevent immediate scheduled loop from re-checking right away.
-                            self._feed_last_checks[f"{guild_id}:{feed_id}"] = datetime.now(self.CST)
-                            logger.info(f"[Startup] Checking RSS feed '{feed_config['name']}' in guild {guild.name}")
-                            await self.process_rss_feed(guild_id, feed_id, feed_config)
-                        except Exception as e:
-                            logger.error(f"[Startup] Error checking feed {feed_id}: {e}")
-                            
-                except Exception as e:
-                    logger.error(f"[Startup] Error processing feeds for guild {guild_id_str}: {e}")
-        except Exception as e:
-            logger.error(f"[Startup] Error during immediate feed check: {e}", exc_info=True)
-
-    @tasks.loop(minutes=1)  # Check every minute to dynamically adjust interval
-    async def check_rss_feeds(self):
-        """Main RSS checking task - checks all feeds across all guilds"""
-
-        current_time = datetime.now(self.CST)
-        logger.info(
-            f"[CheckLoop] Starting feed check cycle at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')} "
-            f"for {len(self.config.get('guilds', {}))} guild(s)"
+    async def _persist_feed_state(self) -> None:
+        await self.db.set_feed_status(
+            self.feed_id,
+            last_pub_date=self.feed_state.get("last_pub_date"),
+            last_entry_key=self.feed_state.get("last_entry_key"),
+            last_message_id=self.feed_state.get("last_message_id"),
+            last_status=self.feed_state.get("last_status"),
         )
-        if not self.config.get("guilds"):
-            logger.warning(
-                f"[CheckLoop] 0 guilds configured in memory. db_mode={'db' if self.db else 'json'}"
+
+    # ------------------------------------------------------------------
+    # Feed fetching and parsing
+    # ------------------------------------------------------------------
+
+    async def fetch_latest_entry(self) -> Optional[dict]:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; MadisonFieldBot/1.0)",
+            "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+        }
+        timeout = aiohttp.ClientTimeout(total=20)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(self.feed_url) as response:
+                    logger.info("Fetched RSS feed %s -> HTTP %s", self.feed_url, response.status)
+                    if response.status != 200:
+                        return None
+
+                    content = await response.text()
+                    feed = feedparser.parse(content)
+                    if not feed.entries:
+                        return None
+                    return feed.entries[0]
+        except Exception as exc:
+            logger.error("Failed to fetch RSS feed: %s", exc, exc_info=True)
+            return None
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        cleaned = unescape(text or "")
+        cleaned = re.sub(r"<[^>]+>", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    @staticmethod
+    def _entry_key(pub_date: str, title: str, link: str) -> str:
+        raw = f"{pub_date}|{title}|{link}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _parse_field_numbers(self, chunk: str) -> List[int]:
+        numbers: List[int] = []
+        normalized = chunk.lower().replace(" and ", ",")
+        for token in re.split(r",\s*", normalized):
+            token = token.strip()
+            if not token:
+                continue
+
+            range_match = re.fullmatch(r"(\d+)\s*(?:-|to)\s*(\d+)", token)
+            if range_match:
+                start = int(range_match.group(1))
+                end = int(range_match.group(2))
+                step = 1 if end >= start else -1
+                numbers.extend(range(start, end + step, step))
+                continue
+
+            amp_match = re.fullmatch(r"(\d+)\s*&\s*(\d+)", token)
+            if amp_match:
+                numbers.extend([int(amp_match.group(1)), int(amp_match.group(2))])
+                continue
+
+            plain_numbers = re.findall(r"\d+", token)
+            numbers.extend(int(value) for value in plain_numbers)
+
+        return sorted(set(numbers))
+
+    def _set_all_fields(self, statuses: Dict[str, Dict[int, str]], state: str) -> None:
+        for park, field_numbers in FIELD_LAYOUT.items():
+            for field_number in field_numbers:
+                statuses[park][field_number] = state
+
+    def _apply_park_wide_statements(self, content: str, statuses: Dict[str, Dict[int, str]]) -> None:
+        text = content.lower()
+
+        combined_all_closed_patterns = [
+            r"\ball\s+fields\s+at\s+dublin\s+park\s+and\s+palmer\s+park\s+are\s+closed\b",
+            r"\ball\s+fields\s+at\s+palmer\s+park\s+and\s+dublin\s+park\s+are\s+closed\b",
+            r"\ball\s+fields\s+at\s+the\s+dublin\s+park\s+and\s+palmer\s+park\s+are\s+closed\b",
+        ]
+        combined_all_open_patterns = [
+            r"\ball\s+fields\s+at\s+dublin\s+park\s+and\s+palmer\s+park\s+are\s+open\b",
+            r"\ball\s+fields\s+at\s+palmer\s+park\s+and\s+dublin\s+park\s+are\s+open\b",
+            r"\ball\s+fields\s+at\s+the\s+dublin\s+park\s+and\s+palmer\s+park\s+are\s+open\b",
+        ]
+
+        if any(re.search(pattern, text) for pattern in combined_all_closed_patterns):
+            self._set_all_fields(statuses, "closed")
+            return
+
+        if any(re.search(pattern, text) for pattern in combined_all_open_patterns):
+            self._set_all_fields(statuses, "open")
+            return
+
+        park_patterns = {
+            "Palmer": {
+                "closed": [
+                    r"\ball\s+fields\s+at\s+palmer\s+park\s+are\s+closed\b",
+                    r"\ball\s+palmer\s+park\s+fields?\s+are\s+closed\b",
+                    r"\ball\s+palmer\s+soccer\s+fields?\s+are\s+closed\b",
+                ],
+                "open": [
+                    r"\ball\s+fields\s+at\s+palmer\s+park\s+are\s+open\b",
+                    r"\ball\s+palmer\s+park\s+fields?\s+are\s+open\b",
+                    r"\ball\s+palmer\s+soccer\s+fields?\s+are\s+open\b",
+                ],
+            },
+            "Dublin": {
+                "closed": [
+                    r"\ball\s+fields\s+at\s+dublin\s+park\s+are\s+closed\b",
+                    r"\ball\s+dublin\s+park\s+fields?\s+are\s+closed\b",
+                    r"\ball\s+dublin\s+soccer\s+fields?\s+are\s+closed\b",
+                ],
+                "open": [
+                    r"\ball\s+fields\s+at\s+dublin\s+park\s+are\s+open\b",
+                    r"\ball\s+dublin\s+park\s+fields?\s+are\s+open\b",
+                    r"\ball\s+dublin\s+soccer\s+fields?\s+are\s+open\b",
+                ],
+            },
+        }
+
+        if (
+            re.search(r"\ball\s+fields\s+(?:are\s+)?closed\b", text)
+            and "palmer" not in text
+            and "dublin" not in text
+        ):
+            self._set_all_fields(statuses, "closed")
+            return
+
+        if (
+            re.search(r"\ball\s+fields\s+(?:are\s+)?open\b", text)
+            and "palmer" not in text
+            and "dublin" not in text
+            and "closed" not in text
+        ):
+            self._set_all_fields(statuses, "open")
+
+        for park, patterns in park_patterns.items():
+            if any(re.search(pattern, text) for pattern in patterns["closed"]):
+                for field_number in FIELD_LAYOUT[park]:
+                    statuses[park][field_number] = "closed"
+            if any(re.search(pattern, text) for pattern in patterns["open"]):
+                for field_number in FIELD_LAYOUT[park]:
+                    statuses[park][field_number] = "open"
+
+    def parse_field_statuses(self, content: str) -> Dict[str, Dict[int, str]]:
+        statuses = {
+            "Palmer": {field_number: "open" for field_number in FIELD_LAYOUT["Palmer"]},
+            "Dublin": {field_number: "open" for field_number in FIELD_LAYOUT["Dublin"]},
+        }
+
+        if not content:
+            return statuses
+
+        text = content.lower()
+        self._apply_park_wide_statements(text, statuses)
+
+        extension_pattern = re.compile(
+            r"\b(?:palmer\s+)?extension(?:\s+fields?)?"
+            r"(?:\s+(?:are|is|was|were|will|be|currently|still|for|today|this|the|all|remaining|remain|remains|stays|stay))*"
+            r"\s*(?P<state>open|closed)\b"
+        )
+
+        for match in extension_pattern.finditer(text):
+            state = match.group("state")
+            for field_number in range(7, 11):
+                statuses["Palmer"][field_number] = state
+
+        field_pattern = re.compile(
+            r"\b(?P<park>palmer|dublin)\s+soccer\s+"
+            r"(?P<fields>\d+(?:\s*(?:-|to|&)\s*\d+)?(?:\s*,\s*\d+(?:\s*(?:-|to|&)\s*\d+)?)*)"
+            r"(?:\s+(?:are|is|was|were|will|be|currently|still|for|today|this|the|all|remaining|remain|remains|stays|stay))*"
+            r"\s*(?P<state>open|closed)\b"
+        )
+
+        for match in field_pattern.finditer(text):
+            park = "Palmer" if match.group("park") == "palmer" else "Dublin"
+            state = match.group("state")
+            field_numbers = self._parse_field_numbers(match.group("fields"))
+            for field_number in field_numbers:
+                if field_number in statuses[park]:
+                    statuses[park][field_number] = state
+
+        return statuses
+
+    @staticmethod
+    def summarize_statuses(statuses: Dict[str, Dict[int, str]]) -> str:
+        open_count = sum(
+            1 for park_fields in statuses.values() for field_state in park_fields.values() if field_state == "open"
+        )
+        total_count = sum(len(park_fields) for park_fields in statuses.values())
+        if open_count == total_count:
+            return "open"
+        if open_count == 0:
+            return "closed"
+        return "partial"
+
+    @staticmethod
+    def format_field_state(state: str) -> str:
+        return "Closed" if state == "closed" else "Open"
+
+    @staticmethod
+    def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+        candidates = []
+        if os.name == "nt":
+            candidates.extend(
+                [
+                    r"C:\Windows\Fonts\arialbd.ttf" if bold else r"C:\Windows\Fonts\arial.ttf",
+                    r"C:\Windows\Fonts\segoeuib.ttf" if bold else r"C:\Windows\Fonts\segoeui.ttf",
+                ]
             )
-         
-        # Iterate through all guilds and their feeds
-        for guild_id_str, guild_config in self.config["guilds"].items():
-            try:
-                guild_id = int(guild_id_str)
-                guild = self.get_guild(guild_id)
-                
-                if not guild:
-                    logger.warning(f"Guild {guild_id} not found, skipping feeds")
+        candidates.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+                if bold
+                else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+                if bold
+                else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            ]
+        )
+
+        for path in candidates:
+            if path and os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size=size)
+                except Exception:
                     continue
-                
-                for feed_id, feed_config in guild_config["feeds"].items():
-                    if not feed_config["enabled"]:
-                        logger.info(
-                            f"[CheckLoop][{guild.name}/{feed_id}] Feed disabled - skipping scheduled check"
-                        )
-                        continue
-                    
-                    # Check if it's time to check this feed
-                    feed_key = f"{guild_id}:{feed_id}"
-                    last_check = self._feed_last_checks.get(feed_key, current_time - timedelta(minutes=30))
-                    
-                    # Determine interval for this specific feed
-                    interval = await self.determine_feed_check_interval(guild_id, feed_id)
-                    time_since_check = (current_time - last_check).total_seconds() / 60
-                    logger.info(
-                        f"[CheckLoop][{guild.name}/{feed_id}] last_check={last_check.strftime('%Y-%m-%d %H:%M:%S %Z')} "
-                        f"elapsed={time_since_check:.2f}m interval={interval:.2f}m"
+
+        return ImageFont.load_default()
+
+    @staticmethod
+    def _wrap_text(text: str, font: ImageFont.ImageFont, max_width: int) -> str:
+        words = text.split()
+        if not words:
+            return text
+
+        lines = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if font.getlength(candidate) <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return "\n".join(lines)
+
+    def _card_label_for_field(self, park: str, field_number: int) -> str:
+        if park == "Palmer" and field_number in range(7, 11):
+            return f"Field {field_number}\nExtension"
+        return f"Field {field_number}"
+
+    def build_park_image(self, park: str, field_states: Dict[int, str]) -> str:
+        field_numbers = list(field_states.keys())
+        total_fields = len(field_numbers)
+        columns = 2 if total_fields >= 10 else 3
+        rows = (total_fields + columns - 1) // columns
+
+        width = 1280
+        top_margin = 54
+        left_margin = 60
+        right_margin = 60
+        bottom_margin = 54
+        gap = 18
+        card_width = (width - left_margin - right_margin - gap * (columns - 1)) // columns
+        card_height = 160
+        height = top_margin + bottom_margin + rows * card_height + (rows - 1) * gap
+
+        background = Image.new("RGBA", (width, height), "#0f1218")
+        draw = ImageDraw.Draw(background)
+
+        field_font = self._load_font(54, bold=True)
+        extension_font = self._load_font(24, bold=True)
+        card_fill = "#171b22"
+        card_outline = "#2a313c"
+        card_text = "#ffffff"
+        extension_text = "#cbd5e1"
+        indicator_size = 84
+        indicator_spacing = 24
+
+        for index, field_number in enumerate(field_numbers):
+            row = index // columns
+            column = index % columns
+            x1 = left_margin + column * (card_width + gap)
+            y1 = top_margin + row * (card_height + gap)
+            x2 = x1 + card_width
+            y2 = y1 + card_height
+
+            state = field_states[field_number]
+            dot_color = IMAGE_CARD_COLORS[state]
+            draw.rounded_rectangle((x1, y1, x2, y2), radius=24, fill=card_fill, outline=card_outline, width=2)
+
+            label = self._card_label_for_field(park, field_number)
+            label_lines = label.split("\n")
+            primary_label = label_lines[0]
+            secondary_label = label_lines[1] if len(label_lines) > 1 else None
+
+            primary_bbox = draw.textbbox((0, 0), primary_label, font=field_font)
+            primary_width = primary_bbox[2] - primary_bbox[0]
+            primary_height = primary_bbox[3] - primary_bbox[1]
+
+            secondary_width = 0
+            secondary_height = 0
+            if secondary_label:
+                secondary_bbox = draw.textbbox((0, 0), secondary_label, font=extension_font)
+                secondary_width = secondary_bbox[2] - secondary_bbox[0]
+                secondary_height = secondary_bbox[3] - secondary_bbox[1]
+
+            text_width = max(primary_width, secondary_width)
+            text_height = primary_height + (6 + secondary_height if secondary_label else 0)
+            group_width = indicator_size + indicator_spacing + text_width
+            group_height = max(indicator_size, text_height)
+
+            group_x = x1 + (card_width - group_width) / 2
+            group_y = y1 + (card_height - group_height) / 2
+
+            indicator_y = group_y + (group_height - indicator_size) / 2
+            indicator_box = (group_x, indicator_y, group_x + indicator_size, indicator_y + indicator_size)
+            if state == "closed":
+                cut = indicator_size * 0.28
+                draw.polygon(
+                    [
+                        (indicator_box[0] + cut, indicator_box[1]),
+                        (indicator_box[2] - cut, indicator_box[1]),
+                        (indicator_box[2], indicator_box[1] + cut),
+                        (indicator_box[2], indicator_box[3] - cut),
+                        (indicator_box[2] - cut, indicator_box[3]),
+                        (indicator_box[0] + cut, indicator_box[3]),
+                        (indicator_box[0], indicator_box[3] - cut),
+                        (indicator_box[0], indicator_box[1] + cut),
+                    ],
+                    fill=dot_color,
+                )
+            else:
+                draw.ellipse(indicator_box, fill=dot_color)
+
+            text_x = group_x + indicator_size + indicator_spacing
+            text_y = group_y + (group_height - text_height) / 2
+            draw.text((text_x, text_y), primary_label, font=field_font, fill=card_text)
+
+            if secondary_label:
+                draw.text(
+                    (text_x, text_y + primary_height + 6),
+                    secondary_label,
+                    font=extension_font,
+                    fill=extension_text,
+                )
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{park.lower()}_fields.png")
+        temp_file.close()
+        background.convert("RGB").save(temp_file.name, format="PNG", optimize=True)
+        return temp_file.name
+
+    def build_embeds(
+        self,
+        entry: dict,
+        content: str,
+        statuses: Dict[str, Dict[int, str]],
+        pub_date: str,
+    ) -> tuple[List[discord.Embed], Dict[str, str]]:
+        summary = self.summarize_statuses(statuses)
+        title = entry.get("title") or "Field Status Update"
+        link = entry.get("link") or ""
+
+        if summary == "open":
+            color = 0x2ECC71
+        elif summary == "closed":
+            color = 0xE74C3C
+        else:
+            color = 0xF39C12
+
+        published_at = self._parse_datetime(pub_date)
+        description = content or "No additional details were provided in the RSS entry."
+        if len(description) > 4096:
+            description = description[:4093] + "..."
+
+        main_embed = discord.Embed(
+            title=title[:256],
+            url=NEWSFLASH_URL,
+            description=description,
+            color=color,
+            timestamp=published_at,
+        )
+        main_embed.add_field(name="Overall Status", value=summary.title(), inline=True)
+        main_embed.add_field(
+            name="Updated",
+            value=published_at.strftime("%b %d, %Y %I:%M %p %Z") if pub_date else "Unknown",
+            inline=True,
+        )
+        main_embed.add_field(
+            name="Source",
+            value=f"[Open Madison Newsflash]({NEWSFLASH_URL})",
+            inline=False,
+        )
+        footer_text = "Madison Parks & Recreation"
+        if self.is_dev_mode:
+            footer_text += " | Dev mode"
+        main_embed.set_footer(text=footer_text)
+
+        palmer_embed = discord.Embed(
+            title="Palmer Fields",
+            description=f"{sum(1 for state in statuses['Palmer'].values() if state == 'closed')} closed of {len(FIELD_LAYOUT['Palmer'])}.",
+            color=0x2D7DD2 if summary != "closed" else color,
+        )
+        palmer_image = self.build_park_image("Palmer", statuses["Palmer"])
+        palmer_embed.set_image(url="attachment://palmer_fields.png")
+
+        dublin_embed = discord.Embed(
+            title="Dublin Fields",
+            description=f"{sum(1 for state in statuses['Dublin'].values() if state == 'closed')} closed of {len(FIELD_LAYOUT['Dublin'])}.",
+            color=0x7D5BA6 if summary != "closed" else color,
+        )
+        dublin_image = self.build_park_image("Dublin", statuses["Dublin"])
+        dublin_embed.set_image(url="attachment://dublin_fields.png")
+
+        return [main_embed, palmer_embed, dublin_embed], {
+            "palmer_fields.png": palmer_image,
+            "dublin_fields.png": dublin_image,
+        }
+
+    def _parse_datetime(self, pub_date: str) -> datetime:
+        if not pub_date:
+            return datetime.now(self.CST)
+        try:
+            parsed = parsedate_to_datetime(pub_date)
+            if parsed.tzinfo is None:
+                return self.CST.localize(parsed)
+            return parsed.astimezone(self.CST)
+        except Exception:
+            return datetime.now(self.CST)
+
+    @staticmethod
+    def _extract_entry_content(entry: dict) -> str:
+        summary = entry.get("summary", "") or entry.get("description", "")
+        if summary:
+            return summary
+
+        content = entry.get("content", [])
+        if isinstance(content, list) and content:
+            first = content[0]
+            if isinstance(first, dict):
+                return first.get("value", "") or ""
+        return ""
+
+    async def _append_history_entry(
+        self,
+        entry: dict,
+        content: str,
+        pub_date: str,
+        statuses: Dict[str, Dict[int, str]],
+        entry_key: str,
+    ) -> None:
+        closed_fields = [
+            f"{park} {field_number}"
+            for park, field_map in statuses.items()
+            for field_number, state in field_map.items()
+            if state == "closed"
+        ]
+
+        await self.db.add_history_entry(
+            self.feed_id,
+            {
+                "pub_date": pub_date,
+                "title": entry.get("title", ""),
+                "content": content,
+                "status": self.summarize_statuses(statuses),
+                "entry_key": entry_key,
+                "closed_fields": closed_fields,
+                "contains_soccer": "soccer" in content.lower(),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Discord message management
+    # ------------------------------------------------------------------
+
+    async def _resolve_channel(self) -> Optional[discord.TextChannel]:
+        channel = self.get_channel(self.channel_id)
+        if channel is not None:
+            return channel
+
+        try:
+            fetched = await self.fetch_channel(self.channel_id)
+            if isinstance(fetched, discord.TextChannel):
+                return fetched
+        except Exception as exc:
+            logger.error("Failed to resolve target channel: %s", exc, exc_info=True)
+        return None
+
+    async def _cleanup_channel_messages(
+        self, channel: discord.TextChannel, keep_message_id: Optional[int]
+    ) -> None:
+        if not self.user:
+            return
+
+        deleted_count = 0
+
+        try:
+            async for message in channel.history(limit=None, oldest_first=False):
+                if keep_message_id and message.id == int(keep_message_id):
+                    continue
+
+                try:
+                    await message.delete()
+                    deleted_count += 1
+                except discord.NotFound:
+                    continue
+                except discord.Forbidden:
+                    logger.error(
+                        "Missing permission to delete message %s in #%s.",
+                        message.id,
+                        channel.name,
                     )
-                    
-                    if time_since_check >= interval:
-                        logger.info(f"Checking RSS feed '{feed_config['name']}' in guild {guild.name} (interval: {interval} minutes)")
-                        self._feed_last_checks[feed_key] = current_time
-                        
-                        # Process the feed
-                        await self.process_rss_feed(guild_id, feed_id, feed_config)
-                    else:
-                        logger.info(
-                            f"[CheckLoop][{guild.name}/{feed_id}] Not due yet - next check in {max(interval - time_since_check, 0):.2f}m"
-                        )
-                        
-            except Exception as e:
-                logger.error(f"Error processing feeds for guild {guild_id_str}: {e}")
+                    return
+                except Exception as exc:
+                    logger.error(
+                        "Failed to delete message %s in #%s: %s",
+                        message.id,
+                        channel.name,
+                        exc,
+                        exc_info=True,
+                    )
 
-    async def determine_feed_check_interval(self, guild_id: int, feed_id: str) -> float:
-        """Determine interval using per-feed settings and schedule windows."""
-        feed_config = self.get_feed_config(guild_id, feed_id) or {}
-        check_intervals = feed_config.get("check_intervals", {})
-        schedule = feed_config.get("schedule", {})
+        except discord.Forbidden:
+            logger.error("Missing permission to read message history in #%s.", channel.name)
+            return
+        except Exception as exc:
+            logger.error("Failed to clean up channel #%s: %s", channel.name, exc, exc_info=True)
+            return
 
-        normal = float(check_intervals.get("normal", 3))
-        peak = float(check_intervals.get("peak", normal))
-        weather = float(check_intervals.get("weather", peak))
+        if deleted_count:
+            logger.info("Deleted %s non-bot message(s) from #%s.", deleted_count, channel.name)
 
-        now = datetime.now(self.CST)
-        now_minutes = now.hour * 60 + now.minute
-        weekday = now.weekday()
+    @staticmethod
+    def _build_file_objects(image_payloads: Dict[str, str]) -> List[discord.File]:
+        return [discord.File(path, filename=filename) for filename, path in image_payloads.items()]
 
-        for window in schedule.get("peak_times", []):
+    @staticmethod
+    def _cleanup_temp_files(image_payloads: Dict[str, str]) -> None:
+        for path in image_payloads.values():
             try:
-                start_h, start_m = map(int, window.get("start", "00:00").split(":"))
-                end_h, end_m = map(int, window.get("end", "00:00").split(":"))
-                start_minutes = start_h * 60 + start_m
-                end_minutes = end_h * 60 + end_m
-                days = window.get("days", [])
-                if weekday in days and start_minutes <= now_minutes <= end_minutes:
-                    return peak
+                if path and os.path.exists(path):
+                    os.remove(path)
             except Exception:
                 continue
 
-        if schedule.get("weather_check"):
-            try:
-                if await self.check_weather_conditions(feed_config):
-                    return weather
-            except Exception:
-                pass
+    async def _upsert_single_message(
+        self,
+        channel: discord.TextChannel,
+        embeds: List[discord.Embed],
+        image_payloads: Dict[str, str],
+    ) -> Optional[int]:
+        message_id = self.feed_state.get("last_message_id")
 
-        return normal
-
-    async def process_rss_feed(self, guild_id: int, feed_id: str, feed_config: dict):
-        """Process a single RSS feed."""
-        feed_key = f"{guild_id}:{feed_id}"
-        if feed_key in self._feed_processing:
-            logger.info(f"[{feed_id}] Check already in progress — skipping duplicate invocation")
-            return
-
-        self._feed_processing.add(feed_key)
         try:
-            logger.info(f"[{feed_id}] Fetching feed URL: {feed_config.get('url', '(missing url)')}")
-            feed = await self.fetch_rss_feed_url(feed_config["url"])
-            if not feed or not feed.entries:
-                logger.warning(f"No RSS entries found for feed {feed_id}")
+            if message_id:
+                try:
+                    message = await channel.fetch_message(int(message_id))
+                    await message.edit(embeds=embeds, attachments=self._build_file_objects(image_payloads))
+                    return int(message_id)
+                except discord.NotFound:
+                    logger.info("Stored message id %s was not found; creating a new message.", message_id)
+                except discord.Forbidden:
+                    logger.warning("Missing permission to edit the stored Discord message; creating a new one.")
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to edit stored Discord message; creating a new one: %s",
+                        exc,
+                        exc_info=True,
+                    )
+
+            try:
+                message = await channel.send(embeds=embeds, files=self._build_file_objects(image_payloads))
+                return message.id
+            except discord.Forbidden:
+                logger.error("Missing permission to send the Discord message.")
+            except Exception as exc:
+                logger.error("Failed to send Discord message: %s", exc, exc_info=True)
+            return None
+        finally:
+            self._cleanup_temp_files(image_payloads)
+
+    async def sync_latest_entry(self, force_refresh: bool = False) -> None:
+        async with self._poll_lock:
+            entry = await self.fetch_latest_entry()
+            if not entry:
+                logger.warning("No RSS entries were returned from the feed.")
                 return
 
-            latest_entry = feed.entries[0]
-            content = latest_entry.get("summary", "") or latest_entry.get("description", "")
-            pub_date = latest_entry.get("published", "")
-            title = latest_entry.get("title", "RSS Update")
-            link = latest_entry.get("link", "")
-            guid = latest_entry.get("id", "") or latest_entry.get("guid", "")
-            logger.info(
-                f"[{feed_id}] Latest entry title={title!r} pub_date={pub_date!r} guid={guid!r} link={link!r}"
-            )
-            entry_key_source = f"{guid}|{link}|{pub_date}|{title}"
-            entry_key = hashlib.sha256(entry_key_source.encode("utf-8")).hexdigest()
+            title = entry.get("title", "Field Status Update")
+            link = entry.get("link", "")
+            pub_date = entry.get("published") or entry.get("updated") or ""
+            content = self._clean_text(self._extract_entry_content(entry))
+            entry_key = self._entry_key(pub_date, title, link)
 
-            guild_id_str = str(guild_id)
-            # ── Dedup: always read from DB so restarts don't re-post ──────────
-            if self.db:
-                last_pub_date = await self.db.get_last_pub_date(guild_id_str, feed_id)
-            else:
-                last_pub_date = self._feed_last_pub_dates.get(feed_key)
-
-            logger.info(
-                f"[{feed_id}] feed pub_date={pub_date!r}  db last={last_pub_date!r}"
-            )
-
-            if pub_date == last_pub_date:
-                logger.info(f"[{feed_id}] No change (pub_date unchanged) — skipping")
+            channel = await self._resolve_channel()
+            if not channel:
+                logger.error("Could not resolve the configured Discord channel.")
                 return
 
-            logger.info(f"[{feed_id}] New entry detected — processing")
-
-            # ── Parse ─────────────────────────────────────────────────────────
-            previous_status = (
-                await self.db.get_last_status(guild_id_str, feed_id)
-                if self.db else None
-            )
-            parsed_data = await self.parse_feed_content(
-                feed_config, content, title, latest_entry, previous_status
-            )
             logger.info(
-                f"[{feed_id}] Parsed status={parsed_data.get('status')!r} should_post={parsed_data.get('should_post', True)} "
-                f"closed_count={len(parsed_data.get('closed_fields', []))}"
+                "Polling %s mode for channel %s",
+                "development" if self.is_dev_mode else "production",
+                self.channel_id,
             )
 
-            if self.db and feed_config["history"]["enabled"]:
-                inserted = await self.db.add_history_entry(
-                    guild_id_str,
-                    feed_id,
-                    {
-                        "pub_date": pub_date,
-                        "title": title,
-                        "content": content[:2000],
-                        "entry_key": entry_key,
-                        "status": parsed_data.get("status"),
-                        "closed_fields": parsed_data.get("closed_fields", []),
-                        "contains_soccer": parsed_data.get("contains_soccer", False),
-                    },
-                )
-                if not inserted:
-                    logger.info(f"[{feed_id}] Duplicate history entry detected — skipping repost")
-                    await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
-                    logger.info(f"[{feed_id}] Updated last_pub_date despite duplicate history entry")
+            keep_message_id = int(self.feed_state["last_message_id"]) if self.feed_state.get("last_message_id") else None
+            await self._cleanup_channel_messages(channel, keep_message_id)
+
+            if (
+                not force_refresh
+                and entry_key == self.feed_state.get("last_entry_key")
+                and self.feed_state.get("last_message_id")
+            ):
+                try:
+                    await channel.fetch_message(int(self.feed_state["last_message_id"]))
+                    logger.info("Latest RSS entry is unchanged; no Discord edit is needed.")
+                    return
+                except discord.NotFound:
+                    logger.info("Stored message was deleted; recreating the current status message.")
+                except discord.Forbidden:
+                    logger.error("Missing permission to inspect the stored Discord message.")
+                    return
+                except Exception as exc:
+                    logger.error("Failed to verify the stored Discord message: %s", exc, exc_info=True)
                     return
 
-            # ── Post ──────────────────────────────────────────────────────────
-            if parsed_data.get("should_post", True):
-                channel = self.get_channel(feed_config["channel_id"])
-                if channel:
-                    guild_config = self.get_guild_config(guild_id)
-                    await self.post_or_edit_feed_update(
-                        guild_id,
-                        guild_id_str,
-                        feed_id,
-                        feed_config,
-                        parsed_data,
-                        pub_date,
-                        channel,
-                        guild_config["role_pings"],
-                    )
-                    if self.db:
-                        await self.db.set_last_pub_date(guild_id_str, feed_id, pub_date)
-                    else:
-                        self._feed_last_pub_dates[feed_key] = pub_date
-                    logger.info(f"[{feed_id}] Posted to #{channel.name}")
-                else:
-                    logger.error(f"[{feed_id}] Channel {feed_config['channel_id']} not found")
-            else:
-                logger.info(f"[{feed_id}] Update seen but should_post=False (status unchanged)")
+            statuses = self.parse_field_statuses(content)
+            embeds, image_payloads = self.build_embeds(entry, content, statuses, pub_date)
 
-            # ── Store metadata ─────────────────────────────────────────────────
-            if self.db:
-                # Store the last status for future comparison
-                await self.db.set_last_status(guild_id_str, feed_id, parsed_data.get("status"))
+            message_id = await self._upsert_single_message(channel, embeds, image_payloads)
+            if message_id is None:
+                return
 
-        except Exception as e:
-            logger.error(f"Error processing RSS feed {feed_id}: {e}", exc_info=True)
+            self.feed_state["last_message_id"] = str(message_id)
+            self.feed_state["last_pub_date"] = pub_date
+            self.feed_state["last_entry_key"] = entry_key
+            self.feed_state["last_status"] = self.summarize_statuses(statuses)
+            await self._persist_feed_state()
+            await self._append_history_entry(entry, content, pub_date, statuses, entry_key)
+
+            await self._cleanup_channel_messages(channel, message_id)
+
+            logger.info(
+                "Updated single Discord message with entry %s (%s)",
+                title,
+                pub_date or "no pub_date",
+            )
+
+    # ------------------------------------------------------------------
+    # Bot lifecycle
+    # ------------------------------------------------------------------
+
+    async def setup_hook(self) -> None:
+        await self.db.connect()
+        self.feed_state = await self._load_feed_state()
+        if not self.poll_feed.is_running():
+            self.poll_feed.start()
+
+    async def close(self):
+        try:
+            await self.db.close()
         finally:
-            self._feed_processing.discard(feed_key)
-            logger.info(f"[{feed_id}] Feed check complete")
-
-    async def fetch_rss_feed_url(self, url: str):
-        """Fetch RSS feed from a specific URL"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    logger.info(f"[FeedFetch] GET {url} -> HTTP {response.status}")
-                    if response.status == 200:
-                        content = await response.text()
-                        logger.info(f"[FeedFetch] Received {len(content)} bytes from {url}")
-                        return feedparser.parse(content)
-                    else:
-                        logger.error(f"Failed to fetch RSS feed from {url}: {response.status}")
-                        return None
-        except Exception as e:
-            logger.error(f"Error fetching RSS feed from {url}: {e}")
-            return None
-
-    async def parse_feed_content(
-        self,
-        feed_config: dict,
-        content: str,
-        title: str,
-        entry: dict,
-        previous_status: Optional[str] = None,
-    ) -> dict:
-        """Parse feed content and decide whether to post."""
-        parser_type = feed_config["processing"]["content_parser"]
-
-        parsed_data = {
-            "title": title,
-            "content": content,
-            "link": entry.get("link", ""),
-            "status": "default",
-            "color": feed_config["processing"]["status_colors"]["default"],
-            "should_post": True,
-        }
-
-        if parser_type == "field_status":
-            status, closed_fields, contains_soccer, open_fields = self.parse_field_status(content)
-            parsed_data.update({
-                "status": status,
-                "closed_fields": closed_fields,
-                "open_fields": open_fields,
-                "contains_soccer": contains_soccer,
-                "color": self.STATUS_COLORS.get(status, parsed_data["color"]),
-                "should_post": self.should_post_update(
-                    status, closed_fields, contains_soccer, previous_status
-                ),
-            })
-
-        elif parser_type == "generic":
-            parsed_data.update({
-                "status": "update",
-                "color": feed_config["processing"]["status_colors"]["default"],
-                "should_post": True,
-            })
-
-        return parsed_data
-
-    def get_central_day_key(self, pub_date: str) -> str:
-        """Convert RSS pub_date to YYYY-MM-DD in US/Central."""
-        if not pub_date:
-            return datetime.now(self.CST).strftime("%Y-%m-%d")
-        try:
-            dt = parsedate_to_datetime(pub_date)
-            if dt.tzinfo is None:
-                dt = self.CST.localize(dt)
-            return dt.astimezone(self.CST).strftime("%Y-%m-%d")
-        except Exception:
-            return datetime.now(self.CST).strftime("%Y-%m-%d")
-
-    async def build_daily_field_summary(self, guild_id_str: str, feed_id: str, day_key: str) -> str:
-        """Build a compact same-day summary from feed history."""
-        if not self.db:
-            return ""
-        entries = await self.db.get_history(guild_id_str, feed_id, 100)
-        day_entries = []
-        for entry in reversed(entries):
-            entry_day = self.get_central_day_key(entry.get("pub_date", ""))
-            if entry_day == day_key:
-                status = (entry.get("status") or "unknown").upper()
-                title = entry.get("title") or "(no title)"
-                day_entries.append(f"• {status}: {title}")
-        if not day_entries:
-            return ""
-        return "\n".join(day_entries[-10:])
-
-    async def post_or_edit_feed_update(
-        self,
-        guild_id: int,
-        guild_id_str: str,
-        feed_id: str,
-        feed_config: dict,
-        parsed_data: dict,
-        pub_date: str,
-        channel: discord.TextChannel,
-        role_pings: dict,
-    ):
-        """Edit same-day same-status post; otherwise send a new post."""
-        day_key = self.get_central_day_key(pub_date)
-        status = parsed_data.get("status", "default")
-        summary = await self.build_daily_field_summary(guild_id_str, feed_id, day_key)
-        if summary:
-            parsed_data = dict(parsed_data)
-            parsed_data["content"] = f"{parsed_data.get('content', '')}\n\nToday's Updates\n{summary}"
-
-        embed = await self.create_feed_embed(feed_config, parsed_data, pub_date, guild_id)
-        posted_new = True
-
-        if self.db:
-            post_state = await self.db.get_post_state(guild_id_str, feed_id)
-            same_day = post_state.get("last_post_date") == day_key
-            same_status = post_state.get("last_status") == status
-            message_id = post_state.get("last_message_id")
-            if same_day and same_status and message_id:
-                try:
-                    msg = await channel.fetch_message(int(message_id))
-                    await msg.edit(embed=embed)
-                    posted_new = False
-                except Exception as e:
-                    logger.warning(f"[{feed_id}] Could not edit prior message {message_id}: {e}")
-
-        if posted_new:
-            sent = await self.send_feed_update(channel, embed, role_pings)
-            if self.db:
-                await self.db.set_post_state(
-                    guild_id_str,
-                    feed_id,
-                    day_key,
-                    str(sent.id),
-                    status,
-                )
-
-    def get_default_embed_color(self, guild_id: Optional[int]) -> int:
-        """Get guild default embed color (Discord blurple fallback)."""
-        if guild_id is None:
-            return 0x5865F2
-        guild_config = self.get_guild_config(guild_id)
-        return int(guild_config.get("global_settings", {}).get("default_embed_color", 0x5865F2))
-
-    async def create_feed_embed(
-        self, feed_config: dict, parsed_data: dict, pub_date: str, guild_id: Optional[int] = None
-    ) -> discord.Embed:
-        """Create Discord embed for feed update"""
-        template = feed_config["embed_template"]
-        
-        # Build safe format context (only string/number values, no dicts/lists)
-        format_ctx = {
-            "title": parsed_data["title"],
-            "status": parsed_data.get("status", ""),
-            "content": parsed_data["content"][:1000] + ("..." if len(parsed_data["content"]) > 1000 else ""),
-        }
-
-        title = template["title_template"].format(**format_ctx)
-        description = template["description_template"].format(**format_ctx)
-
-        status = parsed_data.get("status")
-        if feed_config["processing"]["content_parser"] == "field_status":
-            if status == "open":
-                title = "OPEN"
-            elif status == "closed":
-                title = "CLOSED"
-            elif status == "partial":
-                title = "PARTIAL"
-
-        entry_link = parsed_data.get("link")
-        embed = discord.Embed(
-            title=title,
-            url=entry_link if entry_link else None,
-            description=description,
-            color=parsed_data.get("color", self.get_default_embed_color(guild_id)),
-            timestamp=datetime.now()
-        )
-        
-        # Add custom fields from template
-        for field in template["fields"]:
-            embed.add_field(
-                name=field["name"],
-                value=field["value"].format(**format_ctx),
-                inline=field.get("inline", False)
-            )
-        
-        # Add special fields for field_status parser
-        if feed_config["processing"]["content_parser"] == "field_status":
-            if parsed_data.get("status") == "partial" and parsed_data.get("closed_fields"):
-                open_fields = parsed_data.get("open_fields", [])
-                closed_fields = parsed_data.get("closed_fields", [])
-                embed.add_field(
-                    name="Open Fields",
-                    value="\n".join([f"• {field}" for field in open_fields]) if open_fields else "Not explicitly listed",
-                    inline=True
-                )
-                embed.add_field(
-                    name="Closed Fields",
-                    value="\n".join([f"• {field}" for field in closed_fields]),
-                    inline=True
-                )
-                
-            elif parsed_data.get("closed_fields"):
-                embed.add_field(
-                    name="Closed Fields",
-                    value="\n".join([f"• {field}" for field in parsed_data["closed_fields"]]),
-                    inline=False
-                )
-        
-        # Set footer
-        footer_text = pub_date if pub_date else template["footer_text"]
-        embed.set_footer(text=footer_text)
-        
-        # Set thumbnail if configured
-        if template["thumbnail_url"]:
-            embed.set_thumbnail(url=template["thumbnail_url"])
-            
-        return embed
-
-    async def send_feed_update(self, channel: discord.TextChannel, embed: discord.Embed, role_pings: dict):
-        """Send feed update to channel with optional role pings"""
-        channel_id_str = str(channel.id)
-        role_ids = role_pings.get(channel_id_str, [])
-
-        message_content = None
-        role_mentions = []
-        
-        if role_ids:
-            for role_id in role_ids:
-                try:
-                    role = channel.guild.get_role(int(role_id))
-                    if role:
-                        role_mentions.append(role.mention)
-                        logger.info(f"Pinging role {role.name} in channel {channel.name}")
-                    else:
-                        logger.warning(f"Role {role_id} not found in guild {channel.guild.name}")
-                except Exception as e:
-                    logger.error(f"Error getting role {role_id}: {e}")
-            
-            if role_mentions:
-                # Include embed title in message for notifications
-                embed_title = embed.title if embed.title else "RSS Feed Update"
-                message_content = f"{embed_title}\n\n" + " ".join(role_mentions)
-
-        return await channel.send(content=message_content, embed=embed)
-
-    @check_rss_feeds.before_loop
-    async def before_check_rss_feeds(self):
-        """Wait for bot to be ready before starting the loop"""
-        await self.wait_until_ready()
-        logger.info("Starting field status monitoring")
-
-    async def setup_hook(self):
-        """Connect to DB (if configured), load persistent state, register commands."""
-        # Initialize feed state tracking dictionary
-        self._feed_last_checks = {}
-        
-        db_url = os.getenv("DATABASE_URL")
-        if db_url:
-            logger.info("[Startup] DATABASE_URL detected. Loading config/state from database.")
-            # Step 1: connect (if this fails, fall back to JSON entirely)
-            try:
-                self.db = Database(db_url)
-                await self.db.connect()
-                logger.info("Database connected")
-            except Exception as e:
-                logger.error(f"Failed to connect to database: {e} — falling back to JSON", exc_info=True)
-                self.db = None
-
-            # Step 2: load state (if this fails, keep self.db so future writes work)
-            if self.db:
-                try:
-                    stored = await self.db.load_all_guild_configs()
-                    for guild_id, guild_config in stored.items():
-                        self.config["guilds"][guild_id] = guild_config
-                    self._apply_config_defaults(self.config)
-                    feed_states = await self.db.load_all_feed_states()
-                    # Populate _feed_last_pub_dates from DB
-                    self._feed_last_pub_dates.update(feed_states)
-                    logger.info(
-                        f"DB startup: {len(stored)} guild config(s), "
-                        f"{len(feed_states)} feed state(s)"
-                    )
-                    self._log_config_snapshot("db_load")
-                except Exception as e:
-                    logger.error(f"Failed to load state from DB: {e} — starting fresh (DB still active)", exc_info=True)
-                    self._log_config_snapshot("db_load_failed")
-        else:
-            logger.info("No DATABASE_URL set — using local JSON files")
-            self.config = self._load_config_from_json()
-            self._log_config_snapshot("json_load")
-
-        # Create set_role_ping command
-        set_role_ping = app_commands.Command(
-            name="set_role_ping",
-            description="Add/remove role pings for field updates (toggles role, no role = clear all)",
-            callback=self.set_role_ping_callback
-        )
-        set_role_ping.default_permissions = discord.Permissions(administrator=True)
-        
-        # Create repost_status command
-        repost_status = app_commands.Command(
-            name="repost_status",
-            description="Repost a historical status update to a channel for testing",
-            callback=self.repost_status_callback
-        )
-        repost_status.default_permissions = discord.Permissions(manage_messages=True)
-        
-        # Create check_permissions command
-        check_permissions = app_commands.Command(
-            name="check_permissions",
-            description="Check bot permissions for field status monitoring",
-            callback=self.check_permissions_callback
-        )
-        check_permissions.default_permissions = discord.Permissions(manage_messages=True)
-        
-        # Create field_history command
-        field_history = app_commands.Command(
-            name="field_history",
-            description="Show recent field status history",
-            callback=self.field_history_callback
-        )
-        field_history.default_permissions = discord.Permissions(manage_messages=True)
-        
-        # Create simple commands without parameters
-        list_role_pings = app_commands.Command(
-            name="list_role_pings",
-            description="List all configured role pings for field updates",
-            callback=self.list_role_pings_callback
-        )
-        list_role_pings.default_permissions = discord.Permissions(manage_messages=True)
-        
-        field_help = app_commands.Command(
-            name="field_help",
-            description="Show all available field status bot commands",
-            callback=self.field_help_callback
-        )
-        
-        # RSS Feed Management Commands
-        add_feed = app_commands.Command(
-            name="add_feed",
-            description="Add a new RSS feed to monitor",
-            callback=self.add_feed_callback
-        )
-        add_feed.default_permissions = discord.Permissions(administrator=True)
-        
-        list_feeds = app_commands.Command(
-            name="list_feeds", 
-            description="List all RSS feeds configured for this server",
-            callback=self.list_feeds_callback
-        )
-        list_feeds.default_permissions = discord.Permissions(manage_messages=True)
-        
-        remove_feed = app_commands.Command(
-            name="remove_feed",
-            description="Remove an RSS feed",
-            callback=self.remove_feed_callback
-        )
-        remove_feed.default_permissions = discord.Permissions(administrator=True)
-        
-        toggle_feed = app_commands.Command(
-            name="toggle_feed",
-            description="Enable or disable an RSS feed",
-            callback=self.toggle_feed_callback
-        )
-        toggle_feed.default_permissions = discord.Permissions(administrator=True)
-        
-        feed_config = app_commands.Command(
-            name="feed_config",
-            description="View or modify RSS feed configuration",
-            callback=self.feed_config_callback
-        )
-        feed_config.default_permissions = discord.Permissions(administrator=True)
-
-        set_feed_intervals = app_commands.Command(
-            name="set_feed_intervals",
-            description="Update polling intervals (normal/peak/weather) for a feed",
-            callback=self.set_feed_intervals_callback,
-        )
-        set_feed_intervals.default_permissions = discord.Permissions(administrator=True)
-
-        set_feed_peak_window = app_commands.Command(
-            name="set_feed_peak_window",
-            description="Add or clear a peak-time window for a feed",
-            callback=self.set_feed_peak_window_callback,
-        )
-        set_feed_peak_window.default_permissions = discord.Permissions(administrator=True)
-        
-        # Add all commands to tree
-        self.tree.add_command(set_role_ping)
-        self.tree.add_command(repost_status)
-        self.tree.add_command(list_role_pings)
-        self.tree.add_command(check_permissions)
-        self.tree.add_command(field_help)
-        self.tree.add_command(field_history)
-        self.tree.add_command(add_feed)
-        self.tree.add_command(list_feeds)
-        self.tree.add_command(remove_feed)
-        self.tree.add_command(toggle_feed)
-        self.tree.add_command(feed_config)
-        self.tree.add_command(set_feed_intervals)
-        self.tree.add_command(set_feed_peak_window)
-        
-        logger.info("Added all slash commands to command tree")
-
-    # === COMMAND CALLBACKS ===
-    
-    async def set_role_ping_callback(
-        self,
-        interaction: discord.Interaction,
-        channel: discord.TextChannel,
-        role: discord.Role = None,
-    ):
-        """Add or remove role ping for a channel"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        channel_id_str = str(channel.id)
-
-        if role is None:
-            # Remove all role pings for this channel
-            if channel_id_str in guild_config["role_pings"] and guild_config["role_pings"][channel_id_str]:
-                del guild_config["role_pings"][channel_id_str]
-                self.save_config()
-                await interaction.response.send_message(
-                    f"✅ Removed all role pings for {channel.mention}", ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    f"❌ No role pings configured for {channel.mention}", ephemeral=True
-                )
-        else:
-            # Add or remove specific role
-            if channel_id_str not in guild_config["role_pings"]:
-                guild_config["role_pings"][channel_id_str] = []
-            
-            role_id_str = str(role.id)
-            role_list = guild_config["role_pings"][channel_id_str]
-            
-            if role_id_str in role_list:
-                # Remove the role
-                role_list.remove(role_id_str)
-                if not role_list:
-                    # If no roles left, remove the channel entry
-                    del guild_config["role_pings"][channel_id_str]
-                self.save_config()
-                await interaction.response.send_message(
-                    f"✅ Removed {role.mention} from pings for {channel.mention}",
-                    ephemeral=True,
-                )
-            else:
-                # Add the role
-                role_list.append(role_id_str)
-                self.save_config()
-                await interaction.response.send_message(
-                    f"✅ Added {role.mention} to be pinged for updates in {channel.mention}",
-                    ephemeral=True,
-                )
-
-    @app_commands.choices(status_type=[
-        app_commands.Choice(name="Open", value="open"),
-        app_commands.Choice(name="Partially Open", value="partial"),
-        app_commands.Choice(name="Closed", value="closed"),
-    ])
-    async def repost_status_callback(
-        self,
-        interaction: discord.Interaction,
-        channel: discord.TextChannel,
-        status_type: str,
-    ):
-        """Repost a historical status update to a channel for testing"""
-        if not self.db:
-            await interaction.response.send_message(
-                "❌ Repost requires database-backed history.",
-                ephemeral=True,
-            )
-            return
-
-        guild_id_str = str(interaction.guild_id)
-        history_entries = await self.db.get_history(guild_id_str, "madison_field_status", 50)
-        matching_entries = [entry for entry in history_entries if entry.get("status") == status_type]
-
-        if not matching_entries:
-            await interaction.response.send_message(
-                f"❌ No historical '{status_type}' status found", ephemeral=True
-            )
-            return
-
-        # Randomly select one matching entry
-        matching_entry = random.choice(matching_entries)
-
-        # Create embed from historical data
-        try:
-            detected_at = matching_entry.get("detected_at")
-            timestamp = datetime.fromisoformat(detected_at) if detected_at else datetime.now(self.CST)
-            embed = self.create_status_embed(
-                matching_entry["status"],
-                matching_entry.get("closed_fields", []),
-                matching_entry.get("content", ""),
-                timestamp,
-            )
-
-            # Add footer note that this is historical
-            embed.add_field(
-                name="📋 Note",
-                value=f"This is a repost of historical data from {timestamp.strftime('%Y-%m-%d %H:%M:%S CST')}",
-                inline=False,
-            )
-
-            await self.send_status_update(channel, embed)
-            await interaction.response.send_message(
-                f"✅ Reposted '{status_type}' status to {channel.mention}",
-                ephemeral=True,
-            )
-
-        except Exception as e:
-            logger.error(f"Error reposting status: {e}")
-            await interaction.response.send_message(
-                f"❌ Error reposting status: {e}", ephemeral=True
-            )
-
-    async def list_role_pings_callback(self, interaction: discord.Interaction):
-        """List all configured role pings"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if not guild_config["role_pings"]:
-            await interaction.response.send_message(
-                "No role pings configured", ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(
-            title="Configured Role Pings",
-            color=self.get_default_embed_color(interaction.guild_id),
-        )
-
-        for channel_id_str, role_id_list in guild_config["role_pings"].items():
-            try:
-                channel = self.get_channel(int(channel_id_str))
-                channel_name = (
-                    channel.mention
-                    if channel
-                    else f"Unknown Channel ({channel_id_str})"
-                )
-                
-                role_names = []
-                for role_id_str in role_id_list:
-                    role = channel.guild.get_role(int(role_id_str)) if channel else None
-                    role_name = role.mention if role else f"Unknown Role ({role_id_str})"
-                    role_names.append(role_name)
-
-                roles_text = ", ".join(role_names) if role_names else "No roles configured"
-                embed.add_field(
-                    name=f"Channel: {channel_name}",
-                    value=f"Roles: {roles_text}",
-                    inline=False,
-                )
-            except Exception as e:
-                embed.add_field(
-                    name=f"Channel ID: {channel_id_str}",
-                    value=f"Role IDs: {', '.join(role_id_list)} (Error: {e})",
-                    inline=False,
-                )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def check_permissions_callback(
-        self, interaction: discord.Interaction, channel: discord.TextChannel = None
-    ):
-        """Check bot permissions in the specified channel"""
-        target_channel = channel or self.get_channel(self.CHANNEL_ID)
-
-        if not target_channel:
-            await interaction.response.send_message(
-                f"❌ Cannot find channel. Configured channel ID: {self.CHANNEL_ID}\n"
-                "Make sure the channel ID is correct and the bot is in the same server.",
-                ephemeral=True,
-            )
-            return
-
-        # Check bot permissions
-        bot_member = target_channel.guild.get_member(self.user.id)
-        if not bot_member:
-            await interaction.response.send_message(
-                f"❌ Bot is not a member of the server containing {target_channel.mention}",
-                ephemeral=True,
-            )
-            return
-
-        permissions = target_channel.permissions_for(bot_member)
-
-        embed = discord.Embed(
-            title=f"Bot Permissions Check: {target_channel.name}",
-            color=self.get_default_embed_color(interaction.guild_id),
-        )
-
-        # Required permissions for field monitoring
-        required_perms = {
-            "View Channel": permissions.view_channel,
-            "Send Messages": permissions.send_messages,
-            "Embed Links": permissions.embed_links,
-            "Read Message History": permissions.read_message_history,
-        }
-
-        # Optional permissions
-        optional_perms = {
-            "Mention Everyone": permissions.mention_everyone,  # For role pings
-            "Use Slash Commands": permissions.use_slash_commands,
-        }
-
-        # Check required permissions
-        required_status = ""
-        all_required = True
-        for perm_name, has_perm in required_perms.items():
-            status = "✅" if has_perm else "❌"
-            required_status += f"{status} {perm_name}\n"
-            if not has_perm:
-                all_required = False
-
-        embed.add_field(
-            name="Required Permissions", value=required_status, inline=False
-        )
-
-        # Check optional permissions
-        optional_status = ""
-        for perm_name, has_perm in optional_perms.items():
-            status = "✅" if has_perm else "⚠️"
-            optional_status += f"{status} {perm_name}\n"
-
-        embed.add_field(
-            name="Optional Permissions", value=optional_status, inline=False
-        )
-
-        # Overall status
-        if all_required:
-            embed.add_field(
-                name="🎉 Status",
-                value="All required permissions are present! Bot should work correctly.",
-                inline=False,
-            )
-            embed.color = 0x00FF00  # Green
-        else:
-            embed.add_field(
-                name="⚠️ Status",
-                value="Missing required permissions! Bot will not work properly.\n"
-                "Check the DISCORD_PERMISSIONS_GUIDE.md for help.",
-                inline=False,
-            )
-            embed.color = 0xFF0000  # Red
-
-        embed.add_field(
-            name="Channel Info",
-            value=f"Channel: {target_channel.mention}\n"
-            f"Server: {target_channel.guild.name}\n"
-            f"Channel ID: {target_channel.id}",
-            inline=False,
-        )
-
-        # Add role information
-        role_info = "Bot Roles:\n"
-        for role in bot_member.roles[1:]:  # Skip @everyone
-            role_info += f"• {role.name}\n"
-
-        if len(role_info) > 1024:  # Discord embed field limit
-            role_info = role_info[:1020] + "..."
-
-        embed.add_field(
-            name="Role Information", value=role_info or "No special roles", inline=False
-        )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def field_help_callback(self, interaction: discord.Interaction):
-        """Show all available field bot commands"""
-        embed = discord.Embed(
-            title="Madison Field Status Bot Commands",
-            description="Monitor and manage field status updates",
-            color=self.get_default_embed_color(interaction.guild_id),
-        )
-
-        embed.add_field(
-            name="📋 Monitoring Commands",
-            value="◦ `/field_history [limit]` - Show recent status changes\n"
-            "◦ `/repost_status` - Repost historical status for testing\n"
-            "◦ `/check_permissions` - Check bot permissions in channels",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="🔔 Role Ping Management",
-            value="◦ `/set_role_ping` - Set or remove role ping for updates\n"
-            "◦ `/list_role_pings` - List all configured role pings",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="ℹ️ Info",
-            value="◦ `/field_help` - Show this help message\n"
-            "◦ `/set_feed_intervals` - Set normal/peak/weather intervals\n"
-            "◦ `/set_feed_peak_window` - Add/clear peak-time windows",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="🌟 Auto-Monitoring",
-            value="The bot automatically posts updates when:\n"
-            "• Fields reopen after being closed\n"
-            "• Soccer fields are closed\n"
-            "• All fields are closed",
-            inline=False,
-        )
-
-        embed.set_footer(text="Use slash commands for all bot interactions!")
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def field_history_callback(
-        self, interaction: discord.Interaction, limit: int = 5, feed_id: str = "madison_field_status"
-    ):
-        """Show recent field status history from the database."""
-        if limit < 1 or limit > 20:
-            await interaction.response.send_message(
-                "❌ Limit must be between 1 and 20", ephemeral=True
-            )
-            return
-
-        if not self.db:
-            await interaction.response.send_message(
-                "❌ History requires a database connection (set `DATABASE_URL`).", ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        guild_id_str = str(interaction.guild_id)
-        entries = await self.db.get_history(guild_id_str, feed_id, limit)
-
-        if not entries:
-            await interaction.followup.send("No history found for this feed.", ephemeral=True)
-            return
-
-        STATUS_EMOJI = {"open": "🟢", "partial": "🟡", "closed": "🔴"}
-        embed = discord.Embed(
-            title=f"Field Status History — last {len(entries)} updates",
-            color=self.get_default_embed_color(interaction.guild_id),
-        )
-
-        for entry in entries:
-            status = entry.get("status", "unknown")
-            emoji = STATUS_EMOJI.get(status, "⚪")
-            closed = entry.get("closed_fields") or []
-            soccer = " ⚽" if entry.get("contains_soccer") else ""
-            ts = entry.get("detected_at", "")[:19].replace("T", " ")
-
-            field_info = f"\nClosed: {', '.join(closed)}" if closed else ""
-            embed.add_field(
-                name=f"{emoji} {status.title()}{soccer}",
-                value=f"{ts} UTC{field_info}",
-                inline=False,
-            )
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
+            await super().close()
 
     async def on_ready(self):
-        """Called when bot is ready"""
-        logger.info(f"Bot logged in as {self.user.name} ({self.user.id})")
+        logger.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "unknown")
+        if not self._bootstrapped:
+            self._bootstrapped = True
+            await self.sync_latest_entry(force_refresh=self.is_dev_mode)
 
-        # Sync slash commands
-        try:
-            logger.info("Syncing slash commands...")
-            synced = await self.tree.sync()
-            logger.info(f"Successfully synced {len(synced)} slash commands globally")
-            for command in synced:
-                logger.info(f"Synced command: /{command.name}")
-        except discord.HTTPException as e:
-            logger.error(f"HTTP error syncing slash commands: {e}")
-            if e.status == 429:
-                logger.error("Rate limited - commands may have been synced recently")
-            elif e.status == 403:
-                logger.error("Bot lacks permissions to sync commands")
-            else:
-                logger.error(f"HTTP {e.status}: {e.text}")
-        except Exception as e:
-            logger.error(f"Failed to sync slash commands: {e}")
-            logger.error("Commands may not be available until next bot restart")
+    @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
+    async def poll_feed(self):
+        await self.sync_latest_entry()
 
-        if not self.check_rss_feeds.is_running():
-            self.check_rss_feeds.start()
-            logger.info("Started RSS feed checking loop")
-
-    async def on_command_error(self, ctx, error):
-        """Handle legacy command errors (if any remain)"""
-        logger.error(f"Legacy command error: {error}")
-
-    async def on_app_command_error(
-        self, interaction: discord.Interaction, error: app_commands.AppCommandError
-    ):
-        """Handle application command errors"""
-        if isinstance(error, app_commands.CommandSignatureMismatch):
-            logger.error(
-                f"Command signature mismatch for {interaction.command.name}: {error}"
-            )
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ Command signature mismatch. The bot may need to resync commands.",
-                    ephemeral=True,
-                )
-        elif isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "❌ You don't have permission to use this command", ephemeral=True
-            )
-        elif isinstance(error, app_commands.CommandOnCooldown):
-            await interaction.response.send_message(
-                f"❌ Command is on cooldown. Try again in {error.retry_after:.1f}s",
-                ephemeral=True,
-            )
-        else:
-            logger.error(f"App command error: {error}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    f"❌ An error occurred: {error}", ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    f"❌ An error occurred: {error}", ephemeral=True
-                )
-
-    # === RSS FEED MANAGEMENT CALLBACKS ===
-    
-    @app_commands.choices(parser_type=[
-        app_commands.Choice(name="Generic RSS", value="generic"),
-        app_commands.Choice(name="Field Status", value="field_status"),
-        app_commands.Choice(name="Custom", value="custom")
-    ])
-    async def add_feed_callback(
-        self,
-        interaction: discord.Interaction,
-        name: str,
-        url: str,
-        channel: discord.TextChannel,
-        parser_type: str = "generic"
-    ):
-        """Add a new RSS feed to monitor"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        # Generate a unique feed ID
-        feed_id = name.lower().replace(" ", "_").replace("-", "_")
-        counter = 1
-        original_feed_id = feed_id
-        while feed_id in guild_config["feeds"]:
-            feed_id = f"{original_feed_id}_{counter}"
-            counter += 1
-        
-        # Create default feed config
-        default_feed_config = {
-            "name": name,
-            "url": url,
-            "channel_id": channel.id,
-            "enabled": True,
-            "check_intervals": {
-                "normal": 20,
-                "peak": 5,
-                "frequent": 1,
-                "weather": 5
-            },
-            "schedule": {
-                "peak_times": [],
-                "weather_check": False,
-                "weather_location": ""
-            },
-            "processing": {
-                "content_parser": parser_type,
-                "status_colors": {
-                    "default": 0x3498DB,
-                    "success": 0x00FF00,
-                    "warning": 0xFF8C00,
-                    "error": 0xFF0000
-                }
-            },
-            "embed_template": {
-                "title_template": "{title}",
-                "description_template": "{content}",
-                "footer_text": "RSS Feed Update",
-                "thumbnail_url": None,
-                "fields": []
-            },
-            "history": {
-                "enabled": True
-            }
-        }
-        
-        # Add the feed to the guild config
-        guild_config["feeds"][feed_id] = default_feed_config
-        self.save_config()
-        
-        embed = discord.Embed(
-            title="✅ RSS Feed Added",
-            color=0x00FF00,
-            description=f"Successfully added RSS feed **{name}**"
-        )
-        embed.add_field(name="Feed ID", value=feed_id, inline=True)
-        embed.add_field(name="URL", value=url, inline=False)
-        embed.add_field(name="Channel", value=channel.mention, inline=True)
-        embed.add_field(name="Parser", value=parser_type, inline=True)
-        embed.add_field(name="Status", value="Enabled", inline=True)
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def list_feeds_callback(self, interaction: discord.Interaction):
-        """List all RSS feeds configured for this server"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if not guild_config["feeds"]:
-            await interaction.response.send_message(
-                "❌ No RSS feeds configured for this server.", ephemeral=True
-            )
-            return
-        
-        embed = discord.Embed(
-            title="📡 RSS Feeds",
-            color=self.get_default_embed_color(interaction.guild_id),
-            description=f"Configured feeds for **{interaction.guild.name}**"
-        )
-        
-        for feed_id, feed_config in guild_config["feeds"].items():
-            status = "✅ Enabled" if feed_config["enabled"] else "❌ Disabled"
-            channel = self.get_channel(feed_config["channel_id"])
-            channel_name = channel.mention if channel else "Unknown Channel"
-            
-            embed.add_field(
-                name=f"{feed_config['name']} ({feed_id})",
-                value=f"**URL:** {feed_config['url'][:50]}...\n**Channel:** {channel_name}\n**Status:** {status}\n**Parser:** {feed_config['processing']['content_parser']}",
-                inline=False
-            )
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def remove_feed_callback(self, interaction: discord.Interaction, feed_id: str):
-        """Remove an RSS feed"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if feed_id not in guild_config["feeds"]:
-            await interaction.response.send_message(
-                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.", 
-                ephemeral=True
-            )
-            return
-        
-        feed_name = guild_config["feeds"][feed_id]["name"]
-        del guild_config["feeds"][feed_id]
-        self.save_config()
-        
-        await interaction.response.send_message(
-            f"✅ Successfully removed RSS feed **{feed_name}** (`{feed_id}`)", 
-            ephemeral=True
-        )
-
-    async def toggle_feed_callback(self, interaction: discord.Interaction, feed_id: str):
-        """Enable or disable an RSS feed"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if feed_id not in guild_config["feeds"]:
-            await interaction.response.send_message(
-                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.", 
-                ephemeral=True
-            )
-            return
-        
-        feed_config = guild_config["feeds"][feed_id]
-        feed_config["enabled"] = not feed_config["enabled"]
-        self.save_config()
-        
-        status = "enabled" if feed_config["enabled"] else "disabled"
-        emoji = "✅" if feed_config["enabled"] else "❌"
-        
-        await interaction.response.send_message(
-            f"{emoji} RSS feed **{feed_config['name']}** (`{feed_id}`) has been {status}", 
-            ephemeral=True
-        )
-
-    async def feed_config_callback(self, interaction: discord.Interaction, feed_id: str):
-        """View RSS feed configuration"""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-        
-        if feed_id not in guild_config["feeds"]:
-            await interaction.response.send_message(
-                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.", 
-                ephemeral=True
-            )
-            return
-        
-        feed_config = guild_config["feeds"][feed_id]
-        channel = self.get_channel(feed_config["channel_id"])
-        
-        embed = discord.Embed(
-            title=f"⚙️ Feed Configuration: {feed_config['name']}",
-            color=self.get_default_embed_color(interaction.guild_id)
-        )
-        
-        embed.add_field(name="Feed ID", value=feed_id, inline=True)
-        embed.add_field(name="Status", value="✅ Enabled" if feed_config["enabled"] else "❌ Disabled", inline=True)
-        embed.add_field(name="Channel", value=channel.mention if channel else "Unknown", inline=True)
-        
-        embed.add_field(name="RSS URL", value=feed_config["url"], inline=False)
-        embed.add_field(name="Parser Type", value=feed_config["processing"]["content_parser"], inline=True)
-        
-        intervals = feed_config["check_intervals"]
-        interval_text = f"Normal: {intervals['normal']}m | Peak: {intervals['peak']}m | Frequent: {intervals['frequent']}m"
-        embed.add_field(name="Check Intervals", value=interval_text, inline=False)
-        
-        embed.add_field(
-            name="History", 
-            value="✅ Enabled" if feed_config["history"]["enabled"] else "❌ Disabled", 
-            inline=True
-        )
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def set_feed_intervals_callback(
-        self,
-        interaction: discord.Interaction,
-        feed_id: str,
-        normal: float,
-        peak: float,
-        weather: float,
-    ):
-        """Set per-feed polling intervals in minutes."""
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-
-        if feed_id not in guild_config["feeds"]:
-            await interaction.response.send_message(
-                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.",
-                ephemeral=True,
-            )
-            return
-
-        if min(normal, peak, weather) <= 0:
-            await interaction.response.send_message(
-                "❌ Intervals must be greater than 0 minutes.",
-                ephemeral=True,
-            )
-            return
-
-        feed = guild_config["feeds"][feed_id]
-        feed["check_intervals"]["normal"] = round(normal, 2)
-        feed["check_intervals"]["peak"] = round(peak, 2)
-        feed["check_intervals"]["weather"] = round(weather, 2)
-        self.save_config()
-
-        await interaction.response.send_message(
-            f"✅ Updated `{feed_id}` intervals: normal={normal}m, peak={peak}m, weather={weather}m",
-            ephemeral=True,
-        )
-
-    async def set_feed_peak_window_callback(
-        self,
-        interaction: discord.Interaction,
-        feed_id: str,
-        action: str,
-        start: str = "14:30",
-        end: str = "15:30",
-        days_csv: str = "0,1,2,3,4",
-    ):
-        """Add or clear peak windows for a feed.
-
-        days_csv uses Monday=0 .. Sunday=6.
-        """
-        guild_id = interaction.guild_id
-        guild_config = self.get_guild_config(guild_id)
-
-        if feed_id not in guild_config["feeds"]:
-            await interaction.response.send_message(
-                f"❌ Feed `{feed_id}` not found. Use `/list_feeds` to see available feeds.",
-                ephemeral=True,
-            )
-            return
-
-        feed = guild_config["feeds"][feed_id]
-        feed.setdefault("schedule", {})
-        feed["schedule"].setdefault("peak_times", [])
-
-        action_norm = action.strip().lower()
-        if action_norm not in {"add", "clear"}:
-            await interaction.response.send_message(
-                "❌ `action` must be `add` or `clear`.",
-                ephemeral=True,
-            )
-            return
-
-        if action_norm == "clear":
-            feed["schedule"]["peak_times"] = []
-            self.save_config()
-            await interaction.response.send_message(
-                f"✅ Cleared all peak windows for `{feed_id}`.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            start_h, start_m = map(int, start.split(":"))
-            end_h, end_m = map(int, end.split(":"))
-            if not (0 <= start_h <= 23 and 0 <= start_m <= 59 and 0 <= end_h <= 23 and 0 <= end_m <= 59):
-                raise ValueError("Invalid time range")
-        except Exception:
-            await interaction.response.send_message(
-                "❌ Time must use 24h format `HH:MM` (example: `14:30`).",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            days = [int(d.strip()) for d in days_csv.split(",") if d.strip() != ""]
-            if not days or any(d < 0 or d > 6 for d in days):
-                raise ValueError("Days out of range")
-        except Exception:
-            await interaction.response.send_message(
-                "❌ `days_csv` must be comma-separated day indexes 0-6 (Mon=0..Sun=6).",
-                ephemeral=True,
-            )
-            return
-
-        window = {"start": start, "end": end, "days": sorted(set(days))}
-        feed["schedule"]["peak_times"].append(window)
-        self.save_config()
-
-        await interaction.response.send_message(
-            f"✅ Added peak window for `{feed_id}`: {start}-{end} on days {','.join(map(str, window['days']))}.",
-            ephemeral=True,
-        )
+    @poll_feed.before_loop
+    async def before_poll_feed(self):
+        await self.wait_until_ready()
 
 
-# Bot setup and run
-if __name__ == "__main__":
-    # Environment variables (create a .env file or set these)
-    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-    CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+def main():
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    channel_id = os.getenv("DISCORD_CHANNEL_ID")
 
-    if not TOKEN:
+    if not token:
         logger.error("DISCORD_BOT_TOKEN environment variable not set")
-        exit(1)
+        raise SystemExit(1)
 
-    if not CHANNEL_ID:
+    if not channel_id:
         logger.error("DISCORD_CHANNEL_ID environment variable not set")
-        exit(1)
+        raise SystemExit(1)
+
+    if not os.getenv("RSS_FEED_URL"):
+        logger.info("RSS_FEED_URL not set; using the default Madison field feed.")
+
+    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("POSTGRESQL_URL")
+    if not db_url:
+        logger.error("DATABASE_URL environment variable not set")
+        raise SystemExit(1)
 
     bot = FieldStatusBot()
+    bot.run(token)
 
-    try:
-        bot.run(TOKEN)
-    except Exception as e:
-        logger.error(f"Failed to run bot: {e}")
+
+if __name__ == "__main__":
+    main()
