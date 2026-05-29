@@ -377,7 +377,7 @@ class FieldStatusBot(commands.Bot):
         background = Image.new("RGBA", (width, height), "#0f1218")
         draw = ImageDraw.Draw(background)
 
-        field_font = self._load_font(72, bold=True)
+        field_font = self._load_font(56, bold=True)
         extension_font = self._load_font(30, bold=True)
         card_fill = "#171b22"
         card_outline = "#2a313c"
