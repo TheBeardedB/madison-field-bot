@@ -779,8 +779,6 @@ class FieldStatusBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.db.connect()
         self.feed_state = await self._load_feed_state()
-        if not self.poll_feed.is_running():
-            self.poll_feed.start()
 
     async def close(self):
         try:
@@ -790,7 +788,13 @@ class FieldStatusBot(commands.Bot):
 
     async def on_ready(self):
         logger.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "unknown")
+        if self._bootstrapped:
+            return
+
         self._bootstrapped = True
+        await self.sync_latest_entry(force_refresh=True)
+        if not self.poll_feed.is_running():
+            self.poll_feed.start()
 
     @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
     async def poll_feed(self):

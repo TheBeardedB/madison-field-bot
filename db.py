@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS feed_status (
 
 CREATE TABLE IF NOT EXISTS feed_history (
     id              SERIAL PRIMARY KEY,
-    guild_id        BIGINT   NOT NULL,
+    guild_id        TEXT     NOT NULL,
     feed_id         TEXT NOT NULL,
     pub_date        TEXT,
     title           TEXT,
@@ -129,6 +129,7 @@ class Database:
 
     async def add_history_entry(self, guild_id: int, feed_id: str, entry: Dict) -> bool:
         async with self.pool.acquire() as conn:
+            guild_id_text = str(guild_id)
             entry_key = entry.get("entry_key")
 
             if entry_key:
@@ -139,7 +140,7 @@ class Database:
                     WHERE guild_id = $1 AND feed_id = $2 AND entry_key = $3
                     LIMIT 1
                     """,
-                    guild_id,
+                    guild_id_text,
                     feed_id,
                     entry_key,
                 )
@@ -153,7 +154,7 @@ class Database:
                      status, closed_fields, contains_soccer)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
                 """,
-                guild_id,
+                guild_id_text,
                 feed_id,
                 entry.get("pub_date"),
                 entry.get("title", ""),
