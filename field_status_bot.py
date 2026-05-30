@@ -777,28 +777,9 @@ class FieldStatusBot(commands.Bot):
         embeds: List[discord.Embed],
         image_payloads: Dict[str, str],
     ) -> Optional[int]:
-        message_id = self.feed_state.get("last_message_id")
-
         try:
-            if message_id:
-                try:
-                    message = await channel.fetch_message(int(message_id))
-                    await message.edit(embeds=embeds, attachments=self._build_file_objects(image_payloads))
-                    return int(message_id)
-                except discord.NotFound:
-                    logger.info("Stored message id %s was not found; creating a new message.", message_id)
-                except discord.Forbidden:
-                    logger.warning("Missing permission to edit the stored Discord message; creating a new one.")
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to edit stored Discord message; creating a new one: %s",
-                        exc,
-                        exc_info=True,
-                    )
-
-            try:
-                message = await channel.send(embeds=embeds, files=self._build_file_objects(image_payloads))
-                return message.id
+            message = await channel.send(embeds=embeds, files=self._build_file_objects(image_payloads))
+            return message.id
             except discord.Forbidden:
                 logger.error("Missing permission to send the Discord message.")
             except Exception as exc:
@@ -885,7 +866,7 @@ class FieldStatusBot(commands.Bot):
             await self._cleanup_channel_messages(channel, message_id)
 
             logger.info(
-                "Updated single Discord message with entry %s (%s)",
+                "Posted refreshed Discord message with entry %s (%s)",
                 title,
                 pub_date or "no pub_date",
             )
