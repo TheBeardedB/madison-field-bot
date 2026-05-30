@@ -780,10 +780,10 @@ class FieldStatusBot(commands.Bot):
         try:
             message = await channel.send(embeds=embeds, files=self._build_file_objects(image_payloads))
             return message.id
-            except discord.Forbidden:
-                logger.error("Missing permission to send the Discord message.")
-            except Exception as exc:
-                logger.error("Failed to send Discord message: %s", exc, exc_info=True)
+        except discord.Forbidden:
+            logger.error("Missing permission to send the Discord message.")
+        except Exception as exc:
+            logger.error("Failed to send Discord message: %s", exc, exc_info=True)
             return None
         finally:
             self._cleanup_temp_files(image_payloads)
