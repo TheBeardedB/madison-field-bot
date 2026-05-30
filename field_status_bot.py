@@ -54,6 +54,7 @@ FIELD_LAYOUT = {
 IMAGE_CARD_COLORS = {
     "open": "#2ecc71",
     "closed": "#e74c3c",
+    "unknown": "#f1c40f",
 }
 
 IMAGE_THEME_COLORS = {
@@ -61,7 +62,7 @@ IMAGE_THEME_COLORS = {
     "Dublin": "#7d5ba6",
 }
 
-IMAGE_RENDER_VERSION = "2026-05-29-6"
+IMAGE_RENDER_VERSION = "2026-05-29-7"
 
 
 class FieldStatusBot(commands.Bot):
@@ -256,8 +257,8 @@ class FieldStatusBot(commands.Bot):
 
     def parse_field_statuses(self, content: str) -> Dict[str, Dict[int, str]]:
         statuses = {
-            "Palmer": {field_number: "open" for field_number in FIELD_LAYOUT["Palmer"]},
-            "Dublin": {field_number: "open" for field_number in FIELD_LAYOUT["Dublin"]},
+            "Palmer": {field_number: "unknown" for field_number in FIELD_LAYOUT["Palmer"]},
+            "Dublin": {field_number: "unknown" for field_number in FIELD_LAYOUT["Dublin"]},
         }
 
         if not content:
@@ -299,16 +300,28 @@ class FieldStatusBot(commands.Bot):
         open_count = sum(
             1 for park_fields in statuses.values() for field_state in park_fields.values() if field_state == "open"
         )
+        closed_count = sum(
+            1 for park_fields in statuses.values() for field_state in park_fields.values() if field_state == "closed"
+        )
+        unknown_count = sum(
+            1 for park_fields in statuses.values() for field_state in park_fields.values() if field_state == "unknown"
+        )
         total_count = sum(len(park_fields) for park_fields in statuses.values())
         if open_count == total_count:
             return "open"
-        if open_count == 0:
+        if closed_count == total_count:
             return "closed"
+        if unknown_count == total_count:
+            return "unknown"
         return "partial"
 
     @staticmethod
     def format_field_state(state: str) -> str:
-        return "Closed" if state == "closed" else "Open"
+        if state == "closed":
+            return "Closed"
+        if state == "unknown":
+            return "Unknown"
+        return "Open"
 
     @staticmethod
     def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -507,6 +520,15 @@ class FieldStatusBot(commands.Bot):
                     ],
                     fill=dot_color,
                 )
+            elif state == "unknown":
+                draw.polygon(
+                    [
+                        (indicator_box[0] + indicator_size / 2, indicator_box[1]),
+                        (indicator_box[2], indicator_box[3]),
+                        (indicator_box[0], indicator_box[3]),
+                    ],
+                    fill=dot_color,
+                )
             else:
                 draw.ellipse(indicator_box, fill=dot_color)
 
@@ -542,6 +564,8 @@ class FieldStatusBot(commands.Bot):
             color = 0x2ECC71
         elif summary == "closed":
             color = 0xE74C3C
+        elif summary == "unknown":
+            color = 0xF1C40F
         else:
             color = 0xF39C12
 
@@ -575,16 +599,22 @@ class FieldStatusBot(commands.Bot):
 
         palmer_embed = discord.Embed(
             title="Palmer Fields",
-            description=f"{sum(1 for state in statuses['Palmer'].values() if state == 'closed')} closed of {len(FIELD_LAYOUT['Palmer'])}.",
-            color=0x2D7DD2 if summary != "closed" else color,
+            description=(
+                f"{sum(1 for state in statuses['Palmer'].values() if state == 'closed')} closed, "
+                f"{sum(1 for state in statuses['Palmer'].values() if state == 'unknown')} unknown of {len(FIELD_LAYOUT['Palmer'])}."
+            ),
+            color=0x2D7DD2 if summary == "open" else color,
         )
         palmer_image = self.build_park_image("Palmer", statuses["Palmer"])
         palmer_embed.set_image(url="attachment://palmer_fields.png")
 
         dublin_embed = discord.Embed(
             title="Dublin Fields",
-            description=f"{sum(1 for state in statuses['Dublin'].values() if state == 'closed')} closed of {len(FIELD_LAYOUT['Dublin'])}.",
-            color=0x7D5BA6 if summary != "closed" else color,
+            description=(
+                f"{sum(1 for state in statuses['Dublin'].values() if state == 'closed')} closed, "
+                f"{sum(1 for state in statuses['Dublin'].values() if state == 'unknown')} unknown of {len(FIELD_LAYOUT['Dublin'])}."
+            ),
+            color=0x7D5BA6 if summary == "open" else color,
         )
         dublin_image = self.build_park_image("Dublin", statuses["Dublin"])
         dublin_embed.set_image(url="attachment://dublin_fields.png")
