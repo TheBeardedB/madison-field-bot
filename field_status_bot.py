@@ -189,11 +189,17 @@ class FieldStatusBot(commands.Bot):
             r"\ball\s+fields\s+at\s+dublin\s+park\s+and\s+palmer\s+park\s+are\s+closed\b",
             r"\ball\s+fields\s+at\s+palmer\s+park\s+and\s+dublin\s+park\s+are\s+closed\b",
             r"\ball\s+fields\s+at\s+the\s+dublin\s+park\s+and\s+palmer\s+park\s+are\s+closed\b",
+            r"\ball\s+fields\s+at\s+dublin\s+park\s+and\s+palmer\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
+            r"\ball\s+fields\s+at\s+palmer\s+park\s+and\s+dublin\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
+            r"\ball\s+fields\s+at\s+the\s+dublin\s+park\s+and\s+palmer\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
         ]
         combined_all_open_patterns = [
             r"\ball\s+fields\s+at\s+dublin\s+park\s+and\s+palmer\s+park\s+are\s+open\b",
             r"\ball\s+fields\s+at\s+palmer\s+park\s+and\s+dublin\s+park\s+are\s+open\b",
             r"\ball\s+fields\s+at\s+the\s+dublin\s+park\s+and\s+palmer\s+park\s+are\s+open\b",
+            r"\ball\s+fields\s+at\s+dublin\s+park\s+and\s+palmer\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
+            r"\ball\s+fields\s+at\s+palmer\s+park\s+and\s+dublin\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
+            r"\ball\s+fields\s+at\s+the\s+dublin\s+park\s+and\s+palmer\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
         ]
 
         if any(re.search(pattern, text) for pattern in combined_all_closed_patterns):
@@ -210,11 +216,17 @@ class FieldStatusBot(commands.Bot):
                     r"\ball\s+fields\s+at\s+palmer\s+park\s+are\s+closed\b",
                     r"\ball\s+palmer\s+park\s+fields?\s+are\s+closed\b",
                     r"\ball\s+palmer\s+soccer\s+fields?\s+are\s+closed\b",
+                    r"\ball\s+fields\s+at\s+palmer\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
+                    r"\ball\s+palmer\s+park\s+fields?\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
+                    r"\ball\s+palmer\s+soccer\s+fields?\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
                 ],
                 "open": [
                     r"\ball\s+fields\s+at\s+palmer\s+park\s+are\s+open\b",
                     r"\ball\s+palmer\s+park\s+fields?\s+are\s+open\b",
                     r"\ball\s+palmer\s+soccer\s+fields?\s+are\s+open\b",
+                    r"\ball\s+fields\s+at\s+palmer\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
+                    r"\ball\s+palmer\s+park\s+fields?\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
+                    r"\ball\s+palmer\s+soccer\s+fields?\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
                 ],
             },
             "Dublin": {
@@ -222,11 +234,17 @@ class FieldStatusBot(commands.Bot):
                     r"\ball\s+fields\s+at\s+dublin\s+park\s+are\s+closed\b",
                     r"\ball\s+dublin\s+park\s+fields?\s+are\s+closed\b",
                     r"\ball\s+dublin\s+soccer\s+fields?\s+are\s+closed\b",
+                    r"\ball\s+fields\s+at\s+dublin\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
+                    r"\ball\s+dublin\s+park\s+fields?\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
+                    r"\ball\s+dublin\s+soccer\s+fields?\s+(?:will\s+)?(?:remain|stay|be|keep)\s+closed\b",
                 ],
                 "open": [
                     r"\ball\s+fields\s+at\s+dublin\s+park\s+are\s+open\b",
                     r"\ball\s+dublin\s+park\s+fields?\s+are\s+open\b",
                     r"\ball\s+dublin\s+soccer\s+fields?\s+are\s+open\b",
+                    r"\ball\s+fields\s+at\s+dublin\s+park\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
+                    r"\ball\s+dublin\s+park\s+fields?\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
+                    r"\ball\s+dublin\s+soccer\s+fields?\s+(?:will\s+)?(?:remain|stay|be|keep)\s+open\b",
                 ],
             },
         }
@@ -255,16 +273,17 @@ class FieldStatusBot(commands.Bot):
                 for field_number in FIELD_LAYOUT[park]:
                     statuses[park][field_number] = "open"
 
-    def parse_field_statuses(self, content: str) -> Dict[str, Dict[int, str]]:
+    def parse_field_statuses(self, title: str, content: str) -> Dict[str, Dict[int, str]]:
         statuses = {
             "Palmer": {field_number: "unknown" for field_number in FIELD_LAYOUT["Palmer"]},
             "Dublin": {field_number: "unknown" for field_number in FIELD_LAYOUT["Dublin"]},
         }
 
-        if not content:
+        combined_text = " ".join(part for part in [title, content] if part).strip()
+        if not combined_text:
             return statuses
 
-        text = content.lower()
+        text = combined_text.lower()
         self._apply_park_wide_statements(text, statuses)
 
         extension_pattern = re.compile(
@@ -833,7 +852,7 @@ class FieldStatusBot(commands.Bot):
                     logger.error("Failed to verify the stored Discord message: %s", exc, exc_info=True)
                     return
 
-            statuses = self.parse_field_statuses(content)
+            statuses = self.parse_field_statuses(title, content)
             embeds, image_payloads = self.build_embeds(entry, content, statuses, pub_date)
             guild_id = channel.guild.id if channel.guild else 0
 
