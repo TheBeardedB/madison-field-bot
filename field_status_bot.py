@@ -20,6 +20,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from db import Database
+from llm_field_parser import GitHubModelsFieldParser
 
 load_dotenv()
 
@@ -76,6 +77,7 @@ class FieldStatusBot(commands.Bot):
         self.feed_url = os.getenv("RSS_FEED_URL", DEFAULT_FEED_URL).strip()
         self.db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("POSTGRESQL_URL") or ""
         self.db = Database(self.db_url)
+        self.llm_parser = GitHubModelsFieldParser()
         self.feed_id = os.getenv("FEED_ID", "madison-field-status")
         self.feed_state: Dict[str, Optional[str]] = self._default_feed_state()
         self._poll_lock = asyncio.Lock()
@@ -274,10 +276,11 @@ class FieldStatusBot(commands.Bot):
                     statuses[park][field_number] = "open"
 
     def parse_field_statuses(self, title: str, content: str) -> Dict[str, Dict[int, str]]:
-        statuses = {
-            "Palmer": {field_number: "unknown" for field_number in FIELD_LAYOUT["Palmer"]},
-            "Dublin": {field_number: "unknown" for field_number in FIELD_LAYOUT["Dublin"]},
-        }
+        llm_statuses = self._parse_field_statuses_with_llm(title, content)
+        if llm_statuses is not None:
+            return llm_statuses
+
+        statuses = self._default_statuses()
 
         combined_text = " ".join(part for part in [title, content] if part).strip()
         if not combined_text:
@@ -341,6 +344,49 @@ class FieldStatusBot(commands.Bot):
         if state == "unknown":
             return "Unknown"
         return "Open"
+
+    @staticmethod
+    def _default_statuses() -> Dict[str, Dict[int, str]]:
+        return {
+            "Palmer": {field_number: "unknown" for field_number in FIELD_LAYOUT["Palmer"]},
+            "Dublin": {field_number: "unknown" for field_number in FIELD_LAYOUT["Dublin"]},
+        }
+
+    @staticmethod
+    def _apply_llm_statuses(statuses: Dict[str, Dict[int, str]], llm_result: Dict) -> Dict[str, Dict[int, str]]:
+        parks = llm_result.get("parks", {})
+        if not isinstance(parks, dict):
+            return statuses
+
+        for park_name, field_map in parks.items():
+            if park_name not in statuses or not isinstance(field_map, dict):
+                continue
+            for field_key, state in field_map.items():
+                try:
+                    field_number = int(field_key)
+                except (TypeError, ValueError):
+                    continue
+                if field_number not in statuses[park_name]:
+                    continue
+                if state in {"open", "closed", "unknown"}:
+                    statuses[park_name][field_number] = state
+        return statuses
+
+    def _parse_field_statuses_with_llm(self, title: str, content: str) -> Optional[Dict[str, Dict[int, str]]]:
+        if not self.llm_parser.is_ready():
+            return None
+
+        llm_result = self.llm_parser.extract_field_statuses_with_llm(title, content, FIELD_LAYOUT)
+        confidence = float(llm_result.get("confidence", 0.0) or 0.0)
+        reason = llm_result.get("reason", "unknown")
+        if reason != "ok" or confidence < self.llm_parser.min_confidence:
+            logger.info("LLM field parser skipped: reason=%s confidence=%.2f", reason, confidence)
+            return None
+
+        statuses = self._default_statuses()
+        statuses = self._apply_llm_statuses(statuses, llm_result)
+        logger.info("LLM field parser accepted: confidence=%.2f", confidence)
+        return statuses
 
     @staticmethod
     def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:

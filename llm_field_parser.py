@@ -9,11 +9,16 @@ logger = logging.getLogger(__name__)
 
 
 class GitHubModelsFieldParser:
-    """Partial-status closed-field extraction via GitHub Models."""
+    """Field-status extraction via GitHub Models."""
 
     def __init__(self):
-        self.enabled = os.getenv("LLM_PARTIAL_PARSE_ENABLED", "false").lower() == "true"
         self.token = os.getenv("GITHUB_MODELS_TOKEN") or os.getenv("GITHUB_TOKEN")
+        enabled_env = os.getenv("LLM_FIELD_STATUS_ENABLED")
+        if enabled_env is None:
+            enabled_env = os.getenv("LLM_PARTIAL_PARSE_ENABLED")
+        if enabled_env is None:
+            enabled_env = "true" if self.token else "false"
+        self.enabled = enabled_env.lower() == "true"
         self.endpoint = os.getenv(
             "GITHUB_MODELS_ENDPOINT", "https://models.github.ai/inference"
         ).rstrip("/")
@@ -146,5 +151,129 @@ class GitHubModelsFieldParser:
             "closed_fields": normalized,
             "confidence": confidence,
             "raw_closed_fields": raw_closed,
+            "reason": "ok" if confidence >= self.min_confidence else "low_confidence",
+        }
+
+    def extract_field_statuses_with_llm(self, title: str, content: str, canonical_layout: Dict[str, List[int]]) -> Dict:
+        """
+        Returns:
+          {
+            "parks": {
+              "Palmer": {"1": "open|closed|unknown", ...},
+              "Dublin": {"1": "open|closed|unknown", ...}
+            },
+            "confidence": float,
+            "reason": "ok|disabled|missing_token|http_error|invalid_response|..."
+          }
+        """
+        if not self.enabled:
+            return {
+                "parks": {},
+                "confidence": 0.0,
+                "reason": "disabled",
+            }
+        if not self.token:
+            return {
+                "parks": {},
+                "confidence": 0.0,
+                "reason": "missing_token",
+            }
+
+        all_fields = {
+            park: [f"{park} {field_number}" for field_number in field_numbers]
+            for park, field_numbers in canonical_layout.items()
+        }
+
+        system_prompt = (
+            "You classify Madison park field status updates. "
+            "Use the title and body together. "
+            "Return strict JSON only with keys: parks, confidence. "
+            "parks must contain Palmer and Dublin, each mapping allowed field numbers to one of "
+            '"open", "closed", or "unknown". '
+            "Use unknown when the field is not explicitly specified or the status is ambiguous. "
+            "Do not infer closure/opening from season, weather, or context unless explicit. "
+            "If all fields in a park are closed/open, mark every field in that park accordingly. "
+            f"Allowed fields: {all_fields}. "
+            "If the text says all fields at Palmer Park and Dublin Park are closed/open, mark all of them. "
+            "Important: the words Extension or Palmer Extension refer to Palmer fields 7, 8, 9, and 10."
+        )
+
+        user_prompt = json.dumps(
+            {
+                "title": title,
+                "content": content,
+                "allowed_parks": canonical_layout,
+                "all_fields": all_fields,
+                "special_note": "Extension or Palmer Extension means Palmer fields 7, 8, 9, and 10.",
+                "instructions": "Return the per-field status map for Palmer and Dublin.",
+            }
+        )
+
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+
+        req = urllib.request.Request(
+            f"{self.endpoint}/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                raw_resp = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            logger.warning("LLM field-status HTTP error: %s", e)
+            return {"parks": {}, "confidence": 0.0, "reason": "http_error"}
+        except urllib.error.URLError as e:
+            logger.warning("LLM field-status network error: %s", e)
+            return {"parks": {}, "confidence": 0.0, "reason": "network_error"}
+        except Exception as e:
+            logger.warning("LLM field-status request error: %s", e)
+            return {"parks": {}, "confidence": 0.0, "reason": "request_error"}
+
+        try:
+            payload = json.loads(raw_resp)
+            content_text = payload["choices"][0]["message"]["content"]
+            parsed = json.loads(content_text)
+        except Exception:
+            return {"parks": {}, "confidence": 0.0, "reason": "invalid_response"}
+
+        allowed_states = {"open", "closed", "unknown"}
+        normalized = {
+            park: {str(field_number): "unknown" for field_number in field_numbers}
+            for park, field_numbers in canonical_layout.items()
+        }
+
+        parks = parsed.get("parks", {})
+        if isinstance(parks, dict):
+            for park_name, field_map in parks.items():
+                if park_name not in normalized or not isinstance(field_map, dict):
+                    continue
+                for field_key, state in field_map.items():
+                    if str(field_key) not in normalized[park_name]:
+                        continue
+                    if isinstance(state, str) and state.lower() in allowed_states:
+                        normalized[park_name][str(field_key)] = state.lower()
+
+        try:
+            confidence = float(parsed.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+
+        return {
+            "parks": normalized,
+            "confidence": confidence,
             "reason": "ok" if confidence >= self.min_confidence else "low_confidence",
         }
