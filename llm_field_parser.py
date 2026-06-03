@@ -8,6 +8,13 @@ from typing import Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _preview(text: str, limit: int = 500) -> str:
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
 class GitHubModelsFieldParser:
     """Field-status extraction via GitHub Models."""
 
@@ -25,6 +32,20 @@ class GitHubModelsFieldParser:
         self.model = os.getenv("LLM_MODEL", "openai/gpt-4.1-mini")
         self.timeout_seconds = int(os.getenv("LLM_PARTIAL_PARSE_TIMEOUT_SECONDS", "12"))
         self.min_confidence = float(os.getenv("LLM_PARTIAL_MIN_CONFIDENCE", "0.65"))
+        self.verbosity = self._verbosity_depth()
+
+    @staticmethod
+    def _verbosity_depth() -> int:
+        value = os.getenv("LOG_VERBOSITY", "vv").strip().lower()
+        if value == "":
+            return 0
+        if value == "v":
+            return 1
+        if value == "vv":
+            return 2
+        if value == "vvv":
+            return 3
+        return 2
 
     def is_ready(self) -> bool:
         return self.enabled and bool(self.token)
@@ -80,6 +101,19 @@ class GitHubModelsFieldParser:
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
+
+        logger.info(
+            "LLM field-status request model=%s enabled=%s min_confidence=%.2f title_len=%s content_len=%s verbosity=%s",
+            self.model,
+            self.enabled,
+            self.min_confidence,
+            len(title or ""),
+            len(content or ""),
+            self.verbosity,
+        )
+        if self.verbosity >= 3:
+            logger.debug("LLM field-status system prompt: %s", _preview(system_prompt, 1200))
+            logger.debug("LLM field-status user prompt: %s", _preview(user_prompt, 2000))
 
         req = urllib.request.Request(
             f"{self.endpoint}/chat/completions",
@@ -233,6 +267,12 @@ class GitHubModelsFieldParser:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
                 raw_resp = resp.read().decode("utf-8")
+                if self.verbosity >= 3:
+                    logger.debug(
+                        "LLM field-status HTTP %s bytes=%s",
+                        getattr(resp, "status", "unknown"),
+                        len(raw_resp),
+                    )
         except urllib.error.HTTPError as e:
             logger.warning("LLM field-status HTTP error: %s", e)
             return {"parks": {}, "confidence": 0.0, "reason": "http_error"}
@@ -248,6 +288,8 @@ class GitHubModelsFieldParser:
             content_text = payload["choices"][0]["message"]["content"]
             parsed = json.loads(content_text)
         except Exception:
+            if self.verbosity >= 3:
+                logger.debug("LLM field-status invalid JSON response. raw=%s", _preview(raw_resp, 2000))
             return {"parks": {}, "confidence": 0.0, "reason": "invalid_response"}
 
         allowed_states = {"open", "closed", "unknown"}
@@ -271,6 +313,14 @@ class GitHubModelsFieldParser:
             confidence = float(parsed.get("confidence", 0.0))
         except Exception:
             confidence = 0.0
+
+        if self.verbosity >= 3:
+            logger.debug(
+                "LLM field-status parsed confidence=%.2f reason=%s parks=%s",
+                confidence,
+                "ok" if confidence >= self.min_confidence else "low_confidence",
+                normalized,
+            )
 
         return {
             "parks": normalized,

@@ -28,6 +28,19 @@ load_dotenv()
 if os.name == "nt":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+
+def _verbosity_depth() -> int:
+    value = os.getenv("LOG_VERBOSITY", "vv").strip().lower()
+    if value == "":
+        return 0
+    if value == "v":
+        return 1
+    if value == "vv":
+        return 2
+    if value == "vvv":
+        return 3
+    return 2
+
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 console_handler = logging.StreamHandler(sys.stdout)
 try:
@@ -37,7 +50,7 @@ except (AttributeError, OSError):
 console_handler.setFormatter(formatter)
 
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
+root_logger.setLevel({0: logging.ERROR, 1: logging.WARNING, 2: logging.INFO, 3: logging.DEBUG}[_verbosity_depth()])
 if not any(isinstance(handler, logging.StreamHandler) for handler in root_logger.handlers):
     root_logger.addHandler(console_handler)
 
@@ -414,13 +427,11 @@ class FieldStatusBot(commands.Bot):
                 ),
             )
             candidates.extend(static_candidates)
-            logger.info(
+            logger.debug(
                 "Found %s Roboto static font candidate(s) in %s",
                 len(static_candidates),
                 roboto_static_dir,
             )
-            for path in static_candidates:
-                logger.info("Roboto static candidate: %s", path)
         candidates.extend(
             [
                 roboto_root / "Roboto-VariableFont_wdth,wght.ttf",
@@ -455,7 +466,7 @@ class FieldStatusBot(commands.Bot):
             if path_str in seen:
                 continue
             seen.add(path_str)
-            logger.info("Checking font candidate: %s", path_str)
+            logger.debug("Checking font candidate: %s", path_str)
             if path and os.path.exists(path_str):
                 try:
                     font = ImageFont.truetype(path_str, size=size)
@@ -522,7 +533,7 @@ class FieldStatusBot(commands.Bot):
 
         field_font = self._load_font(64, bold=True)
         extension_font = self._load_font(28, bold=True)
-        logger.info(
+        logger.debug(
             "%s renderer font metrics: field_font=%s extension_font=%s",
             park,
             getattr(field_font, "size", "unknown"),
