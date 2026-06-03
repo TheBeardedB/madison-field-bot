@@ -28,6 +28,35 @@ def _format_state_counts(parks: Dict[str, Dict[str, str]]) -> str:
     return "; ".join(summary)
 
 
+def _coerce_confidence(value) -> float:
+    try:
+        if isinstance(value, str):
+            raw_value = value.strip().lower()
+            labeled_values = {
+                "high": 0.9,
+                "very high": 0.98,
+                "medium": 0.65,
+                "moderate": 0.65,
+                "low": 0.3,
+                "very low": 0.1,
+                "confident": 0.9,
+                "uncertain": 0.35,
+            }
+            if raw_value in labeled_values:
+                return labeled_values[raw_value]
+            value = raw_value
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if confidence != confidence:  # NaN check
+        return 0.0
+    if confidence < 0.0:
+        return 0.0
+    if confidence > 1.0:
+        return 1.0
+    return confidence
+
+
 class GitHubModelsFieldParser:
     """Field-status extraction via GitHub Models."""
 
@@ -100,14 +129,15 @@ class GitHubModelsFieldParser:
             "You extract only closed field names from city field status updates. "
             "Rules: do not infer closures that are not explicit, do not include open fields, "
             "if all fields are closed return ['All Fields'], if no closed fields are present return []. "
-            "Return strict JSON only with keys: closed_fields (array of strings), confidence (0..1). "
+            "Return strict JSON only with keys: closed_fields (array of strings), confidence (numeric 0..1). "
+            "Do not use words like high, medium, or low for confidence. "
             "Use names from the allowed canonical list when possible."
         )
         user_prompt = json.dumps(
             {
                 "content": content,
                 "allowed_canonical_fields": canonical_fields,
-                "instructions": "Extract only closed fields.",
+                "instructions": "Extract only closed fields. Confidence must be a numeric value between 0 and 1.",
             }
         )
 
@@ -185,7 +215,7 @@ class GitHubModelsFieldParser:
                 logger.info("LLM field-status response content preview: %s", _preview(content_text, 2500))
             parsed = json.loads(content_text)
             raw_closed = parsed.get("closed_fields", [])
-            confidence = float(parsed.get("confidence", 0.0))
+            confidence = _coerce_confidence(parsed.get("confidence", 0.0))
             if not isinstance(raw_closed, list):
                 raw_closed = []
         except Exception:
@@ -258,7 +288,8 @@ class GitHubModelsFieldParser:
         system_prompt = (
             "You classify Madison park field status updates. "
             "Use the title and body together. "
-            "Return strict JSON only with keys: parks, confidence. "
+            "Return strict JSON only with keys: parks, confidence. Confidence must be numeric 0..1. "
+            "Do not use words like high, medium, or low for confidence. "
             "parks must contain Palmer and Dublin, each mapping allowed field numbers to one of "
             '"open", "closed", or "unknown". '
             "Use unknown when the field is not explicitly specified or the status is ambiguous. "
@@ -276,7 +307,7 @@ class GitHubModelsFieldParser:
                 "allowed_parks": canonical_layout,
                 "all_fields": all_fields,
                 "special_note": "Extension or Palmer Extension means Palmer fields 7, 8, 9, and 10.",
-                "instructions": "Return the per-field status map for Palmer and Dublin.",
+                "instructions": "Return the per-field status map for Palmer and Dublin. Confidence must be numeric 0..1.",
             }
         )
 
@@ -352,6 +383,7 @@ class GitHubModelsFieldParser:
             confidence = float(parsed.get("confidence", 0.0))
         except Exception:
             confidence = 0.0
+        confidence = _coerce_confidence(confidence)
 
         if self._should_log_detail():
             logger.info(
