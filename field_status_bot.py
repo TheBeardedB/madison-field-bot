@@ -17,6 +17,7 @@ import feedparser
 import pytz
 from PIL import Image, ImageDraw, ImageFont
 from discord.ext import commands, tasks
+from discord import app_commands
 from dotenv import load_dotenv
 
 from db import Database
@@ -82,6 +83,7 @@ class FieldStatusBot(commands.Bot):
         self.feed_state: Dict[str, Optional[str]] = self._default_feed_state()
         self._poll_lock = asyncio.Lock()
         self._bootstrapped = False
+        self._app_commands_synced = False
 
     # ------------------------------------------------------------------
     # Persistence
@@ -834,7 +836,14 @@ class FieldStatusBot(commands.Bot):
         finally:
             self._cleanup_temp_files(image_payloads)
 
-    async def sync_latest_entry(self, force_refresh: bool = False) -> None:
+    async def sync_latest_entry(
+        self,
+        force_refresh: bool = False,
+        channel: Optional[discord.TextChannel] = None,
+        persist_state: bool = True,
+        append_history: bool = True,
+        cleanup_channel: bool = True,
+    ) -> None:
         async with self._poll_lock:
             entry = await self.fetch_latest_entry()
             if not entry:
@@ -847,19 +856,25 @@ class FieldStatusBot(commands.Bot):
             content = self._clean_text(self._extract_entry_content(entry))
             entry_key = self._entry_key(pub_date, title, link)
 
-            channel = await self._resolve_channel()
+            if channel is None:
+                channel = await self._resolve_channel()
             if not channel:
                 logger.error("Could not resolve the configured Discord channel.")
                 return
 
             logger.info(
-                "Polling %s mode for channel %s",
+                "Processing %s update for channel %s%s",
                 "development" if self.is_dev_mode else "production",
-                self.channel_id,
+                channel.id,
+                " (test mode)" if not persist_state else "",
             )
 
-            keep_message_id = int(self.feed_state["last_message_id"]) if self.feed_state.get("last_message_id") else None
-            await self._cleanup_channel_messages(channel, keep_message_id)
+            keep_message_id = None
+            if cleanup_channel:
+                keep_message_id = (
+                    int(self.feed_state["last_message_id"]) if self.feed_state.get("last_message_id") else None
+                )
+                await self._cleanup_channel_messages(channel, keep_message_id)
 
             if (
                 not force_refresh
@@ -887,34 +902,38 @@ class FieldStatusBot(commands.Bot):
             if message_id is None:
                 return
 
-            self.feed_state["last_message_id"] = str(message_id)
-            self.feed_state["last_pub_date"] = pub_date
-            self.feed_state["last_entry_key"] = entry_key
-            self.feed_state["last_status"] = self.summarize_statuses(statuses)
-            self.feed_state["render_version"] = IMAGE_RENDER_VERSION
-            await self._persist_feed_state()
-            try:
-                await self._append_history_entry(
-                    guild_id,
-                    entry,
-                    content,
-                    pub_date,
-                    statuses,
-                    entry_key,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to append feed history entry; continuing with posted status message: %s",
-                    exc,
-                    exc_info=True,
-                )
+            if persist_state:
+                self.feed_state["last_message_id"] = str(message_id)
+                self.feed_state["last_pub_date"] = pub_date
+                self.feed_state["last_entry_key"] = entry_key
+                self.feed_state["last_status"] = self.summarize_statuses(statuses)
+                self.feed_state["render_version"] = IMAGE_RENDER_VERSION
+                await self._persist_feed_state()
+                if append_history:
+                    try:
+                        await self._append_history_entry(
+                            guild_id,
+                            entry,
+                            content,
+                            pub_date,
+                            statuses,
+                            entry_key,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to append feed history entry; continuing with posted status message: %s",
+                            exc,
+                            exc_info=True,
+                        )
 
-            await self._cleanup_channel_messages(channel, message_id)
+                if cleanup_channel:
+                    await self._cleanup_channel_messages(channel, message_id)
 
             logger.info(
-                "Posted refreshed Discord message with entry %s (%s)",
+                "Posted refreshed Discord message with entry %s (%s)%s",
                 title,
                 pub_date or "no pub_date",
+                " in test mode" if not persist_state else "",
             )
 
     # ------------------------------------------------------------------
@@ -925,11 +944,55 @@ class FieldStatusBot(commands.Bot):
         await self.db.connect()
         self.feed_state = await self._load_feed_state()
 
+        @self.tree.command(name="test", description="Re-evaluate the latest field update and post it to a chosen channel.")
+        @app_commands.describe(channel="Channel to post the test update to")
+        async def test(interaction: discord.Interaction, channel: discord.TextChannel):
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            logger.info(
+                "/test invoked by %s for channel %s",
+                interaction.user,
+                channel.id,
+            )
+            try:
+                await self.sync_latest_entry(
+                    force_refresh=True,
+                    channel=channel,
+                    persist_state=False,
+                    append_history=False,
+                    cleanup_channel=False,
+                )
+                await interaction.followup.send(
+                    f"Posted a fresh test update to {channel.mention}.",
+                    ephemeral=True,
+                )
+            except Exception as exc:
+                logger.error("Test command failed: %s", exc, exc_info=True)
+                await interaction.followup.send(
+                    f"Test update failed: {exc}",
+                    ephemeral=True,
+                )
+
     async def close(self):
         try:
             await self.db.close()
         finally:
             await super().close()
+
+    async def _sync_app_commands(self) -> None:
+        if self._app_commands_synced:
+            return
+
+        channel = await self._resolve_channel()
+        if not channel or not channel.guild:
+            logger.warning("Skipping app command sync because the target guild could not be resolved.")
+            return
+
+        try:
+            synced = await self.tree.sync(guild=discord.Object(id=channel.guild.id))
+            self._app_commands_synced = True
+            logger.info("Synced %s app command(s) to guild %s", len(synced), channel.guild.id)
+        except Exception as exc:
+            logger.error("Failed to sync app commands: %s", exc, exc_info=True)
 
     async def on_ready(self):
         logger.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "unknown")
@@ -937,6 +1000,7 @@ class FieldStatusBot(commands.Bot):
             return
 
         self._bootstrapped = True
+        await self._sync_app_commands()
 
         needs_refresh = self.feed_state.get("render_version") != IMAGE_RENDER_VERSION
         if not needs_refresh and self.feed_state.get("last_message_id"):
