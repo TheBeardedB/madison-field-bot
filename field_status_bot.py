@@ -390,18 +390,41 @@ class FieldStatusBot(commands.Bot):
 
     def _parse_field_statuses_with_llm(self, title: str, content: str) -> Optional[Dict[str, Dict[int, str]]]:
         if not self.llm_parser.is_ready():
+            logger.info(
+                "LLM field parser unavailable: enabled=%s token_present=%s",
+                self.llm_parser.enabled,
+                bool(self.llm_parser.token),
+            )
             return None
 
         llm_result = self.llm_parser.extract_field_statuses_with_llm(title, content, FIELD_LAYOUT)
         confidence = float(llm_result.get("confidence", 0.0) or 0.0)
         reason = llm_result.get("reason", "unknown")
+        logger.info(
+            "LLM field parser result reason=%s confidence=%.2f threshold=%.2f title_len=%s content_len=%s",
+            reason,
+            confidence,
+            self.llm_parser.min_confidence,
+            len(title or ""),
+            len(content or ""),
+        )
         if reason != "ok" or confidence < self.llm_parser.min_confidence:
-            logger.info("LLM field parser skipped: reason=%s confidence=%.2f", reason, confidence)
+            logger.info(
+                "LLM field parser skipped: reason=%s confidence=%.2f threshold=%.2f",
+                reason,
+                confidence,
+                self.llm_parser.min_confidence,
+            )
             return None
 
         statuses = self._default_statuses()
         statuses = self._apply_llm_statuses(statuses, llm_result)
-        logger.info("LLM field parser accepted: confidence=%.2f", confidence)
+        logger.info(
+            "LLM field parser accepted: confidence=%.2f summary=Palmer=%s Dublin=%s",
+            confidence,
+            statuses["Palmer"],
+            statuses["Dublin"],
+        )
         return statuses
 
     @staticmethod
