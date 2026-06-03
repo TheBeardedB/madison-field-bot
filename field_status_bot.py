@@ -74,6 +74,7 @@ class FieldStatusBot(commands.Bot):
 
         self.CST = pytz.timezone("US/Central")
         self.channel_id = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+        self.guild_id = int(os.getenv("DISCORD_GUILD_ID", "0"))
         self.is_dev_mode = self.channel_id == DEV_CHANNEL_ID
         self.feed_url = os.getenv("RSS_FEED_URL", DEFAULT_FEED_URL).strip()
         self.db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("POSTGRESQL_URL") or ""
@@ -982,15 +983,23 @@ class FieldStatusBot(commands.Bot):
         if self._app_commands_synced:
             return
 
-        channel = await self._resolve_channel()
-        if not channel or not channel.guild:
-            logger.warning("Skipping app command sync because the target guild could not be resolved.")
-            return
-
         try:
-            synced = await self.tree.sync(guild=discord.Object(id=channel.guild.id))
+            global_synced = await self.tree.sync()
+            logger.info("Synced %s global app command(s).", len(global_synced))
+
+            target_guild_id = self.guild_id
+            if not target_guild_id:
+                channel = await self._resolve_channel()
+                if channel and channel.guild:
+                    target_guild_id = channel.guild.id
+
+            if not target_guild_id:
+                logger.warning("Skipping guild app command sync because no guild could be resolved.")
+                return
+
+            synced = await self.tree.sync(guild=discord.Object(id=target_guild_id))
             self._app_commands_synced = True
-            logger.info("Synced %s app command(s) to guild %s", len(synced), channel.guild.id)
+            logger.info("Synced %s guild app command(s) to guild %s", len(synced), target_guild_id)
         except Exception as exc:
             logger.error("Failed to sync app commands: %s", exc, exc_info=True)
 
