@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Dict, List
@@ -55,6 +56,24 @@ def _coerce_confidence(value) -> float:
     if confidence > 1.0:
         return 1.0
     return confidence
+
+
+def _extract_field_number(field_key) -> int | None:
+    if isinstance(field_key, int):
+        return field_key
+    if not isinstance(field_key, str):
+        return None
+    key = " ".join(field_key.strip().split())
+    try:
+        return int(key)
+    except (TypeError, ValueError):
+        match = re.search(r"(\d+)\s*$", key)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 class GitHubModelsFieldParser:
@@ -374,10 +393,13 @@ class GitHubModelsFieldParser:
                 if park_name not in normalized or not isinstance(field_map, dict):
                     continue
                 for field_key, state in field_map.items():
-                    if str(field_key) not in normalized[park_name]:
+                    field_number = _extract_field_number(field_key)
+                    if field_number is None:
+                        continue
+                    if str(field_number) not in normalized[park_name]:
                         continue
                     if isinstance(state, str) and state.lower() in allowed_states:
-                        normalized[park_name][str(field_key)] = state.lower()
+                        normalized[park_name][str(field_number)] = state.lower()
 
         try:
             confidence = float(parsed.get("confidence", 0.0))

@@ -381,7 +381,13 @@ class FieldStatusBot(commands.Bot):
                 try:
                     field_number = int(field_key)
                 except (TypeError, ValueError):
-                    continue
+                    match = re.search(r"(\d+)\s*$", str(field_key).strip())
+                    if not match:
+                        continue
+                    try:
+                        field_number = int(match.group(1))
+                    except (TypeError, ValueError):
+                        continue
                 if field_number not in statuses[park_name]:
                     continue
                 if state in {"open", "closed", "unknown"}:
