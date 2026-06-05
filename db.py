@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS feed_status (
     last_entry_key    TEXT,
     last_message_id   TEXT,
     last_status       TEXT,
+    last_parser       TEXT,
+    last_parse_reason TEXT,
+    last_parse_attempts INTEGER,
     render_version    TEXT,
     updated_at        TIMESTAMPTZ DEFAULT NOW()
 );
@@ -61,18 +64,41 @@ class Database:
             await conn.execute(
                 "ALTER TABLE feed_status ADD COLUMN IF NOT EXISTS render_version TEXT"
             )
+            await conn.execute(
+                "ALTER TABLE feed_status ADD COLUMN IF NOT EXISTS last_parser TEXT"
+            )
+            await conn.execute(
+                "ALTER TABLE feed_status ADD COLUMN IF NOT EXISTS last_parse_reason TEXT"
+            )
+            await conn.execute(
+                "ALTER TABLE feed_status ADD COLUMN IF NOT EXISTS last_parse_attempts INTEGER"
+            )
 
             if legacy_state_exists and not status_exists:
                 await conn.execute(
                     """
                     INSERT INTO feed_status
-                        (feed_id, last_pub_date, last_entry_key, last_message_id, last_status, render_version, updated_at)
+                        (
+                            feed_id,
+                            last_pub_date,
+                            last_entry_key,
+                            last_message_id,
+                            last_status,
+                            last_parser,
+                            last_parse_reason,
+                            last_parse_attempts,
+                            render_version,
+                            updated_at
+                        )
                     SELECT DISTINCT ON (feed_id)
                         feed_id,
                         last_pub_date,
                         NULL,
                         last_message_id,
                         last_status,
+                        NULL,
+                        NULL,
+                        NULL,
                         NULL,
                         COALESCE(updated_at, NOW())
                     FROM feed_state
@@ -82,6 +108,9 @@ class Database:
                             last_entry_key = EXCLUDED.last_entry_key,
                             last_message_id = EXCLUDED.last_message_id,
                             last_status = EXCLUDED.last_status,
+                            last_parser = EXCLUDED.last_parser,
+                            last_parse_reason = EXCLUDED.last_parse_reason,
+                            last_parse_attempts = EXCLUDED.last_parse_attempts,
                             render_version = EXCLUDED.render_version,
                             updated_at = EXCLUDED.updated_at
                     """
@@ -97,7 +126,15 @@ class Database:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT last_pub_date, last_entry_key, last_message_id, last_status, render_version
+                SELECT
+                    last_pub_date,
+                    last_entry_key,
+                    last_message_id,
+                    last_status,
+                    last_parser,
+                    last_parse_reason,
+                    last_parse_attempts,
+                    render_version
                 FROM feed_status
                 WHERE feed_id = $1
                 """,
@@ -112,19 +149,36 @@ class Database:
         last_entry_key: Optional[str] = None,
         last_message_id: Optional[str] = None,
         last_status: Optional[str] = None,
+        last_parser: Optional[str] = None,
+        last_parse_reason: Optional[str] = None,
+        last_parse_attempts: Optional[int] = None,
         render_version: Optional[str] = None,
     ) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO feed_status
-                    (feed_id, last_pub_date, last_entry_key, last_message_id, last_status, render_version, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                    (
+                        feed_id,
+                        last_pub_date,
+                        last_entry_key,
+                        last_message_id,
+                        last_status,
+                        last_parser,
+                        last_parse_reason,
+                        last_parse_attempts,
+                        render_version,
+                        updated_at
+                    )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
                 ON CONFLICT (feed_id) DO UPDATE
                     SET last_pub_date = EXCLUDED.last_pub_date,
                         last_entry_key = EXCLUDED.last_entry_key,
                         last_message_id = EXCLUDED.last_message_id,
                         last_status = EXCLUDED.last_status,
+                        last_parser = EXCLUDED.last_parser,
+                        last_parse_reason = EXCLUDED.last_parse_reason,
+                        last_parse_attempts = EXCLUDED.last_parse_attempts,
                         render_version = EXCLUDED.render_version,
                         updated_at = NOW()
                 """,
@@ -133,6 +187,9 @@ class Database:
                 last_entry_key,
                 last_message_id,
                 last_status,
+                last_parser,
+                last_parse_reason,
+                last_parse_attempts,
                 render_version,
             )
 

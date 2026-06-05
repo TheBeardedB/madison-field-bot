@@ -9,7 +9,7 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 import discord
@@ -78,6 +78,13 @@ IMAGE_THEME_COLORS = {
 }
 
 IMAGE_RENDER_VERSION = "2026-05-29-7"
+LAST_PARSER_LLM = "llm"
+LAST_PARSER_FALLBACK = "fallback"
+LOW_CONFIDENCE_REASON = "Low_Confidence"
+RETRY_LIMIT_REASON = "retry_limit_reached"
+MAX_LLM_PARSE_ATTEMPTS = 3
+PERMANENT_LLM_FAILURE_REASONS = {"disabled", "missing_token", "llm_unavailable"}
+TRANSIENT_LLM_FAILURE_REASONS = {"http_error", "network_error", "request_error", "invalid_response"}
 
 
 class FieldStatusBot(commands.Bot):
@@ -110,6 +117,9 @@ class FieldStatusBot(commands.Bot):
             "last_entry_key": None,
             "last_message_id": None,
             "last_status": None,
+            "last_parser": None,
+            "last_parse_reason": None,
+            "last_parse_attempts": 0,
             "render_version": None,
         }
 
@@ -127,8 +137,48 @@ class FieldStatusBot(commands.Bot):
             last_entry_key=self.feed_state.get("last_entry_key"),
             last_message_id=self.feed_state.get("last_message_id"),
             last_status=self.feed_state.get("last_status"),
+            last_parser=self.feed_state.get("last_parser"),
+            last_parse_reason=self.feed_state.get("last_parse_reason"),
+            last_parse_attempts=self.feed_state.get("last_parse_attempts"),
             render_version=self.feed_state.get("render_version"),
         )
+
+    @staticmethod
+    def _normalize_parse_reason(reason: Optional[str]) -> str:
+        if not reason:
+            return "unknown"
+
+        normalized = reason.strip()
+        if normalized.lower() == "low_confidence":
+            return LOW_CONFIDENCE_REASON
+        return normalized
+
+    @staticmethod
+    def _should_retry_llm(
+        last_parser: Optional[str],
+        last_parse_reason: Optional[str],
+        last_parse_attempts: Optional[int],
+    ) -> bool:
+        parser = (last_parser or "").strip().lower()
+        reason = (last_parse_reason or "").strip().lower()
+        attempts = int(last_parse_attempts or 0)
+        return (
+            parser != LAST_PARSER_LLM
+            and reason != "low_confidence"
+            and reason not in PERMANENT_LLM_FAILURE_REASONS
+            and attempts < MAX_LLM_PARSE_ATTEMPTS
+        )
+
+    @staticmethod
+    def _skip_llm_reason(last_parse_reason: Optional[str], last_parse_attempts: Optional[int]) -> str:
+        reason = (last_parse_reason or "").strip().lower()
+        if reason == "low_confidence":
+            return LOW_CONFIDENCE_REASON
+        if reason in PERMANENT_LLM_FAILURE_REASONS:
+            return reason
+        if int(last_parse_attempts or 0) >= MAX_LLM_PARSE_ATTEMPTS:
+            return RETRY_LIMIT_REASON
+        return last_parse_reason or "unknown"
 
     # ------------------------------------------------------------------
     # Feed fetching and parsing
@@ -291,16 +341,28 @@ class FieldStatusBot(commands.Bot):
                 for field_number in FIELD_LAYOUT[park]:
                     statuses[park][field_number] = "open"
 
-    def parse_field_statuses(self, title: str, content: str) -> Dict[str, Dict[int, str]]:
-        llm_statuses = self._parse_field_statuses_with_llm(title, content)
+    def parse_field_statuses_with_metadata(
+        self,
+        title: str,
+        content: str,
+        allow_llm: bool = True,
+        skipped_reason: Optional[str] = None,
+    ) -> Tuple[Dict[str, Dict[int, str]], str, str, bool]:
+        llm_attempted = False
+        llm_statuses = None
+        llm_reason = "unknown"
+
+        if allow_llm:
+            llm_statuses, llm_reason, llm_attempted = self._parse_field_statuses_with_llm(title, content)
         if llm_statuses is not None:
-            return llm_statuses
+            return llm_statuses, LAST_PARSER_LLM, llm_reason, llm_attempted
 
         statuses = self._default_statuses()
 
         combined_text = " ".join(part for part in [title, content] if part).strip()
         if not combined_text:
-            return statuses
+            reason = self._normalize_parse_reason(skipped_reason if not allow_llm else llm_reason)
+            return statuses, LAST_PARSER_FALLBACK, reason, llm_attempted
 
         text = combined_text.lower()
         self._apply_park_wide_statements(text, statuses)
@@ -331,6 +393,11 @@ class FieldStatusBot(commands.Bot):
                 if field_number in statuses[park]:
                     statuses[park][field_number] = state
 
+        reason = skipped_reason if not allow_llm else llm_reason
+        return statuses, LAST_PARSER_FALLBACK, self._normalize_parse_reason(reason), llm_attempted
+
+    def parse_field_statuses(self, title: str, content: str) -> Dict[str, Dict[int, str]]:
+        statuses, _, _, _ = self.parse_field_statuses_with_metadata(title, content)
         return statuses
 
     @staticmethod
@@ -394,14 +461,16 @@ class FieldStatusBot(commands.Bot):
                     statuses[park_name][field_number] = state
         return statuses
 
-    def _parse_field_statuses_with_llm(self, title: str, content: str) -> Optional[Dict[str, Dict[int, str]]]:
+    def _parse_field_statuses_with_llm(
+        self, title: str, content: str
+    ) -> Tuple[Optional[Dict[str, Dict[int, str]]], str, bool]:
         if not self.llm_parser.is_ready():
             logger.info(
                 "LLM field parser unavailable: enabled=%s token_present=%s",
                 self.llm_parser.enabled,
                 bool(self.llm_parser.token),
             )
-            return None
+            return None, "llm_unavailable", False
 
         llm_result = self.llm_parser.extract_field_statuses_with_llm(title, content, FIELD_LAYOUT)
         confidence = float(llm_result.get("confidence", 0.0) or 0.0)
@@ -415,13 +484,14 @@ class FieldStatusBot(commands.Bot):
             len(content or ""),
         )
         if reason != "ok" or confidence < self.llm_parser.min_confidence:
+            parse_reason = self._normalize_parse_reason(reason)
             logger.info(
                 "LLM field parser skipped: reason=%s confidence=%.2f threshold=%.2f",
-                reason,
+                parse_reason,
                 confidence,
                 self.llm_parser.min_confidence,
             )
-            return None
+            return None, parse_reason, True
 
         statuses = self._default_statuses()
         statuses = self._apply_llm_statuses(statuses, llm_result)
@@ -431,7 +501,7 @@ class FieldStatusBot(commands.Bot):
             statuses["Palmer"],
             statuses["Dublin"],
         )
-        return statuses
+        return statuses, "ok", True
 
     @staticmethod
     def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -917,10 +987,18 @@ class FieldStatusBot(commands.Bot):
                 )
                 await self._cleanup_channel_messages(channel, keep_message_id)
 
+            last_parser = self.feed_state.get("last_parser")
+            last_parse_reason = self.feed_state.get("last_parse_reason")
+            last_parse_attempts = int(self.feed_state.get("last_parse_attempts") or 0)
+            same_entry = entry_key == self.feed_state.get("last_entry_key")
+            should_retry_llm = self._should_retry_llm(last_parser, last_parse_reason, last_parse_attempts)
+            attempt_llm = force_refresh or not same_entry or should_retry_llm
+
             if (
                 not force_refresh
-                and entry_key == self.feed_state.get("last_entry_key")
+                and same_entry
                 and self.feed_state.get("last_message_id")
+                and not attempt_llm
             ):
                 try:
                     await channel.fetch_message(int(self.feed_state["last_message_id"]))
@@ -934,8 +1012,28 @@ class FieldStatusBot(commands.Bot):
                 except Exception as exc:
                     logger.error("Failed to verify the stored Discord message: %s", exc, exc_info=True)
                     return
+            elif same_entry and not attempt_llm:
+                logger.info(
+                    "Latest RSS entry is unchanged and LLM retry is skipped after parser=%s reason=%s attempts=%s.",
+                    last_parser or "unknown",
+                    last_parse_reason or "unknown",
+                    last_parse_attempts,
+                )
+            elif same_entry and should_retry_llm:
+                logger.info(
+                    "Latest RSS entry is unchanged, last parse used parser=%s reason=%s attempts=%s; retrying LLM.",
+                    last_parser or "unknown",
+                    last_parse_reason or "unknown",
+                    last_parse_attempts,
+                )
 
-            statuses = self.parse_field_statuses(title, content)
+            skip_reason = self._skip_llm_reason(last_parse_reason, last_parse_attempts) if same_entry and not attempt_llm else None
+            statuses, parser_name, parse_reason, llm_attempted = self.parse_field_statuses_with_metadata(
+                title,
+                content,
+                allow_llm=attempt_llm,
+                skipped_reason=skip_reason,
+            )
             embeds, image_payloads = self.build_embeds(entry, content, statuses, pub_date)
             guild_id = channel.guild.id if channel.guild else 0
 
@@ -943,11 +1041,23 @@ class FieldStatusBot(commands.Bot):
             if message_id is None:
                 return
 
+            parse_reason_key = (parse_reason or "").strip().lower()
+            if parser_name == LAST_PARSER_LLM:
+                parse_attempts = 0
+            elif llm_attempted and parse_reason_key in TRANSIENT_LLM_FAILURE_REASONS:
+                base_attempts = last_parse_attempts if same_entry else 0
+                parse_attempts = min(base_attempts + 1, MAX_LLM_PARSE_ATTEMPTS)
+            else:
+                parse_attempts = last_parse_attempts if same_entry else 0
+
             if persist_state:
                 self.feed_state["last_message_id"] = str(message_id)
                 self.feed_state["last_pub_date"] = pub_date
                 self.feed_state["last_entry_key"] = entry_key
                 self.feed_state["last_status"] = self.summarize_statuses(statuses)
+                self.feed_state["last_parser"] = parser_name
+                self.feed_state["last_parse_reason"] = parse_reason
+                self.feed_state["last_parse_attempts"] = parse_attempts
                 self.feed_state["render_version"] = IMAGE_RENDER_VERSION
                 await self._persist_feed_state()
                 if append_history:
