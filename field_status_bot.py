@@ -915,7 +915,7 @@ class FieldStatusBot(commands.Bot):
             return
 
         if deleted_count:
-            logger.info("Deleted %s non-bot message(s) from #%s.", deleted_count, channel.name)
+            logger.info("Deleted %s message(s) from #%s.", deleted_count, channel.name)
 
     @staticmethod
     def _build_file_objects(image_payloads: Dict[str, str]) -> List[discord.File]:
@@ -980,13 +980,6 @@ class FieldStatusBot(commands.Bot):
                 " (test mode)" if not persist_state else "",
             )
 
-            keep_message_id = None
-            if cleanup_channel:
-                keep_message_id = (
-                    int(self.feed_state["last_message_id"]) if self.feed_state.get("last_message_id") else None
-                )
-                await self._cleanup_channel_messages(channel, keep_message_id)
-
             last_parser = self.feed_state.get("last_parser")
             last_parse_reason = self.feed_state.get("last_parse_reason")
             last_parse_attempts = int(self.feed_state.get("last_parse_attempts") or 0)
@@ -1034,6 +1027,10 @@ class FieldStatusBot(commands.Bot):
                 allow_llm=attempt_llm,
                 skipped_reason=skip_reason,
             )
+
+            if cleanup_channel:
+                await self._cleanup_channel_messages(channel, None)
+
             embeds, image_payloads = self.build_embeds(entry, content, statuses, pub_date)
             guild_id = channel.guild.id if channel.guild else 0
 
@@ -1076,9 +1073,6 @@ class FieldStatusBot(commands.Bot):
                             exc,
                             exc_info=True,
                         )
-
-                if cleanup_channel:
-                    await self._cleanup_channel_messages(channel, message_id)
 
             logger.info(
                 "Posted refreshed Discord message with entry %s (%s)%s",

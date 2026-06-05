@@ -170,7 +170,7 @@ class Database:
                         render_version,
                         updated_at
                     )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
                 ON CONFLICT (feed_id) DO UPDATE
                     SET last_pub_date = EXCLUDED.last_pub_date,
                         last_entry_key = EXCLUDED.last_entry_key,
