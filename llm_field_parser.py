@@ -305,9 +305,11 @@ class GitHubModelsFieldParser:
         }
 
         system_prompt = (
-            "You classify Madison park field status updates. "
-            "Use the title and body together. "
-            "Return strict JSON only with keys: parks, confidence. Confidence must be numeric 0..1. "
+            "You classify Madison park field status updates. Use the title and body together. "
+            "FIRST: Determine the update type: "
+            "'field_status' = update about soccer/athletic field status, 'no_field_relevance' = about parks/facilities but NOT fields (e.g., pools, playgrounds, maintenance, events). "
+            "If type is 'no_field_relevance', return: {\"type\": \"no_field_relevance\", \"confidence\": 1.0}. "
+            "If type is 'field_status', return strict JSON with keys: type, parks, confidence. Confidence must be numeric 0..1. "
             "Do not use words like high, medium, or low for confidence. "
             "parks must contain Palmer and Dublin, each mapping allowed field numbers to one of "
             '"open", "closed", or "unknown". '
@@ -379,7 +381,19 @@ class GitHubModelsFieldParser:
         except Exception:
             if self._should_log_detail():
                 logger.info("LLM field-status invalid JSON response. raw=%s", _preview(raw_resp, 2000))
-            return {"parks": {}, "confidence": 0.0, "reason": "invalid_response"}
+            return {"parks": {}, "confidence": 0.0, "reason": "invalid_response", "type": "unknown"}
+
+        # Check if LLM classified this as non-field-relevant
+        update_type = parsed.get("type", "field_status")
+        if isinstance(update_type, str) and update_type.lower() == "no_field_relevance":
+            if self._should_log_detail():
+                logger.info("LLM field-status classified as no_field_relevance; skipping field parsing")
+            return {
+                "parks": {},
+                "confidence": 1.0,
+                "reason": "no_field_relevance",
+                "type": "no_field_relevance",
+            }
 
         allowed_states = {"open", "closed", "unknown"}
         normalized = {
@@ -419,4 +433,5 @@ class GitHubModelsFieldParser:
             "parks": normalized,
             "confidence": confidence,
             "reason": "ok" if confidence >= self.min_confidence else "low_confidence",
+            "type": "field_status",
         }

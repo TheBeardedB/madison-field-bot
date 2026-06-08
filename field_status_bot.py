@@ -83,7 +83,7 @@ LAST_PARSER_FALLBACK = "fallback"
 LOW_CONFIDENCE_REASON = "Low_Confidence"
 RETRY_LIMIT_REASON = "retry_limit_reached"
 MAX_LLM_PARSE_ATTEMPTS = 3
-PERMANENT_LLM_FAILURE_REASONS = {"disabled", "missing_token", "llm_unavailable"}
+PERMANENT_LLM_FAILURE_REASONS = {"disabled", "missing_token", "llm_unavailable", "no_field_relevance"}
 TRANSIENT_LLM_FAILURE_REASONS = {"http_error", "network_error", "request_error", "invalid_response"}
 
 
@@ -1027,6 +1027,23 @@ class FieldStatusBot(commands.Bot):
                 allow_llm=attempt_llm,
                 skipped_reason=skip_reason,
             )
+
+            # If this is a non-field-relevant update (e.g., pool closure), skip posting but log intentionally
+            if parse_reason and parse_reason.lower() == "no_field_relevance":
+                title_preview = (title[:200] + "...") if len(title or "") > 200 else title
+                logger.info(
+                    "Skipping post for non-field-relevant update: title=%s reason=%s",
+                    title_preview,
+                    parse_reason,
+                )
+                parse_attempts = last_parse_attempts if same_entry else 0
+                if persist_state:
+                    self.feed_state["last_entry_key"] = entry_key
+                    self.feed_state["last_parser"] = parser_name
+                    self.feed_state["last_parse_reason"] = parse_reason
+                    self.feed_state["last_parse_attempts"] = str(parse_attempts)
+                    await self._persist_feed_state()
+                return
 
             if cleanup_channel:
                 await self._cleanup_channel_messages(channel, None)
